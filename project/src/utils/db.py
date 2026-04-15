@@ -145,6 +145,26 @@ def create_tables():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS job_scope_rules (
+            id SERIAL PRIMARY KEY,
+            service_type VARCHAR(100) UNIQUE NOT NULL,
+            units_threshold INTEGER NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Seed defaults only if table is empty
+    cur.execute("SELECT COUNT(*) FROM job_scope_rules")
+    if cur.fetchone()[0] == 0:
+        cur.execute("""
+            INSERT INTO job_scope_rules (service_type, units_threshold) VALUES
+            ('air_duct', 3),
+            ('chimney', 4),
+            ('power_washing', 2)
+            ON CONFLICT (service_type) DO NOTHING
+        """)
+
     _ensure_schema_migration(cur)
 
     conn.commit()
@@ -211,6 +231,7 @@ def _ensure_schema_migration(cur):
             ("calendar_credentials", "JSONB"),
             ("calendar_connected", "BOOLEAN DEFAULT FALSE"),
             ("home_address", "VARCHAR(500)"),
+            ("calendar_color_id", "VARCHAR(5) DEFAULT '7'"),
         ],
         "appointments": [
             ("quoted_price", "DECIMAL(10, 2)"),
@@ -1437,3 +1458,33 @@ def get_call_stats():
         cur.close()
         conn.close()
 
+
+def get_job_scope_rules():
+    """Return all job scope rules as a dict keyed by service_type."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT service_type, units_threshold, updated_at FROM job_scope_rules ORDER BY service_type")
+        rows = cur.fetchall()
+        return {r["service_type"]: dict(r) for r in rows}
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_job_scope_rule(service_type: str, units_threshold: int):
+    """Insert or update a job scope rule threshold."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO job_scope_rules (service_type, units_threshold, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (service_type) DO UPDATE SET
+                units_threshold = EXCLUDED.units_threshold,
+                updated_at = CURRENT_TIMESTAMP
+        """, (service_type, units_threshold))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()

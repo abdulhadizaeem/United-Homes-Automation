@@ -3,8 +3,11 @@ import logging
 import traceback
 import secrets
 import string
+from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+
+load_dotenv()
 from src.utils.auth import require_admin
 from src.utils.db import (
     get_all_users_paginated,
@@ -125,7 +128,7 @@ async def create_user(
                 user_email=request.email,
                 user_name=request.username,
                 temp_password=temp_password,
-                login_url=f"{frontend_url}/login"
+                login_url=f"{frontend_url}/signin"
             )
         except Exception as mail_err:
             logging.error(f"Welcome email failed: {mail_err}")
@@ -393,7 +396,12 @@ async def admin_calendar_google_connect(current_user: dict = Depends(require_adm
 
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-    redirect_uri = os.getenv("ADMIN_GOOGLE_REDIRECT_URI", os.getenv("GOOGLE_REDIRECT_URI", ""))
+    
+    # Bulletproof fallback in case .env doesn't reload properly
+    tech_uri = os.getenv("GOOGLE_REDIRECT_URI", "")
+    smart_fallback = tech_uri.replace("/api/calendar/", "/api/admin/calendar/") if tech_uri else ""
+    redirect_uri = os.getenv("ADMIN_GOOGLE_REDIRECT_URI") or smart_fallback
+    
     scopes = ["https://www.googleapis.com/auth/calendar"]
 
     flow = Flow.from_client_config(
@@ -428,15 +436,22 @@ async def admin_calendar_google_callback(
 
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-    redirect_uri = os.getenv("ADMIN_GOOGLE_REDIRECT_URI", os.getenv("GOOGLE_REDIRECT_URI", ""))
+    
+    # Bulletproof fallback
+    tech_uri = os.getenv("GOOGLE_REDIRECT_URI", "")
+    smart_fallback = tech_uri.replace("/api/calendar/", "/api/admin/calendar/") if tech_uri else ""
+    redirect_uri = os.getenv("ADMIN_GOOGLE_REDIRECT_URI") or smart_fallback
+    
     frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    if not frontend_url.startswith("http"):
+        frontend_url = f"https://{frontend_url}"
     scopes = ["https://www.googleapis.com/auth/calendar"]
 
     from src.utils.jwt_utils import verify_oauth_state_token
 
     state_data = verify_oauth_state_token(state)
     if not state_data:
-        return RedirectResponse(url=f"{frontend_url}/admin/calendar?status=error&reason=invalid_state")
+        return RedirectResponse(url=f"{frontend_url}/dashboard?calendar_status=error&reason=invalid_state")
 
     try:
         flow = Flow.from_client_config(
@@ -468,11 +483,11 @@ async def admin_calendar_google_callback(
             "scopes": list(credentials.scopes) if credentials.scopes else scopes,
         }
         save_admin_calendar_credentials("google", calendar_email, creds_dict)
-        return RedirectResponse(url=f"{frontend_url}/admin/calendar?status=connected")
+        return RedirectResponse(url=f"{frontend_url}/dashboard?calendar_status=connected")
     except Exception as e:
         logging.error(f"Admin calendar callback error: {e}")
         traceback.print_exc()
-        return RedirectResponse(url=f"{frontend_url}/admin/calendar?status=error")
+        return RedirectResponse(url=f"{frontend_url}/dashboard?calendar_status=error")
 
 
 @router.get("/calendar/status")

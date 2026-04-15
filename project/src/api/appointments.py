@@ -173,6 +173,8 @@ class FindTechnicianRequest(BaseModel):
     confirmed_latitude: float
     confirmed_longitude: float
     requested_date: str  # YYYY-MM-DD format
+    preferred_time: Optional[str] = None  # HH:MM in 24-hour format, e.g. "13:00"
+    job_units: Optional[int] = None  # number of systems/fireplaces/areas for heavy-job check
 
 
 class TechnicianInfo(BaseModel):
@@ -202,6 +204,7 @@ class BookAppointmentRequest(BaseModel):
     duration_minutes: int
     quoted_price: Optional[float] = None
     discount_applied: Optional[str] = None
+    job_units: Optional[int] = None  # passed so backend can insert a blocked second slot
 
 
 class BookAppointmentResponse(BaseModel):
@@ -267,10 +270,10 @@ SERVICE_DURATIONS = {
     "air_duct": 120,
 }
 
-# Business hours (Eastern Time)
-BUSINESS_START_HOUR = 8   # 8:00 AM
-BUSINESS_END_HOUR = 17    # 5:00 PM
-TRAVEL_BUFFER_MINUTES = 30
+# Fixed booking slots (hour, minute) in Eastern Time
+FIXED_SLOTS = [(9, 0), (12, 0), (15, 0), (17, 0)]
+# Overflow -- offered as 5th slot only when all 4 main slots are taken
+OVERFLOW_SLOTS = [(11, 0), (13, 0)]
 
 
 @router.post("/find-technician-availability", response_model=FindTechnicianResponse)
@@ -320,6 +323,21 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
 
         candidates = []
 
+        # Load job scope rules once and determine if this is a heavy job
+        from src.utils.db import get_job_scope_rules
+        _scope_rules = get_job_scope_rules()
+        is_heavy = bool(
+            request.job_units
+            and request.service_type in _scope_rules
+            and request.job_units >= _scope_rules[request.service_type]["units_threshold"]
+        )
+        if is_heavy:
+            logging.info(
+                "[AVAILABILITY] Heavy job: %s with %d units (threshold=%d)",
+                request.service_type, request.job_units,
+                _scope_rules[request.service_type]["units_threshold"],
+            )
+
         for tech in techs:
             # Skip techs without home coordinates
             if not tech.get("home_latitude") or not tech.get("home_longitude"):
@@ -332,58 +350,101 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             # Appointments already loaded from the combined query
             appointments = sorted(tech["appointments"], key=lambda a: a["start_time"])
 
-            # Step 3: Find the earliest available slot
-            slot_start = datetime(req_date.year, req_date.month, req_date.day,
-                                  BUSINESS_START_HOUR, 0, tzinfo=eastern)
-            business_end = datetime(req_date.year, req_date.month, req_date.day,
-                                    BUSINESS_END_HOUR, 0, tzinfo=eastern)
+            # Step 3: Find best available fixed time slot
             slot_duration = timedelta(minutes=service_duration)
-            travel_buffer = timedelta(minutes=TRAVEL_BUFFER_MINUTES)
-
             found_slot = None
             depart_from_lat = float(tech["home_latitude"])
             depart_from_lon = float(tech["home_longitude"])
 
-            if not appointments:
-                # No appointments -- first slot of the day from home
-                if slot_start + slot_duration <= business_end:
-                    found_slot = slot_start
-                    # Distance from home
+            # Build fixed slot datetimes for this day
+            main_slots = [
+                datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
+                for h, m in FIXED_SLOTS
+            ]
+            overflow_slots = [
+                datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
+                for h, m in OVERFLOW_SLOTS
+            ]
+
+            def _slot_conflicts(candidate, appts):
+                """Return True if candidate overlaps any existing appointment."""
+                candidate_end = candidate + slot_duration
+                for a in appts:
+                    a_start = a["start_time"]
+                    a_end = a["end_time"]
+                    if hasattr(a_start, 'tzinfo') and a_start.tzinfo is None:
+                        a_start = a_start.replace(tzinfo=eastern)
+                    if hasattr(a_end, 'tzinfo') and a_end.tzinfo is None:
+                        a_end = a_end.replace(tzinfo=eastern)
+                    if max(candidate, a_start) < min(candidate_end, a_end):
+                        return True
+                return False
+
+            def _departure_point(slot, appts):
+                """Return (lat, lon) of last completed job before slot, or home."""
+                prev = [
+                    a for a in appts
+                    if (a["end_time"].replace(tzinfo=eastern)
+                        if hasattr(a["end_time"], 'tzinfo') and a["end_time"].tzinfo is None
+                        else a["end_time"]) <= slot
+                ]
+                if prev:
+                    last = max(prev, key=lambda a: a["end_time"])
+                    return float(last["latitude"]), float(last["longitude"])
+                return float(tech["home_latitude"]), float(tech["home_longitude"])
+
+            # Sort by customer preference: nearest fixed slot to preferred time
+            if request.preferred_time:
+                try:
+                    ph, pm = map(int, request.preferred_time.split(":"))
+                    pref_dt = datetime(req_date.year, req_date.month, req_date.day,
+                                       ph, pm, tzinfo=eastern)
+                    slot_order = sorted(main_slots,
+                                        key=lambda s: abs((s - pref_dt).total_seconds()))
+                except Exception:
+                    slot_order = main_slots
             else:
-                # Try to fit before the first appointment
-                first_appt_start = appointments[0]["start_time"]
-                if hasattr(first_appt_start, 'tzinfo') and first_appt_start.tzinfo is None:
-                    first_appt_start = first_appt_start.replace(tzinfo=eastern)
+                slot_order = main_slots
 
-                if slot_start + slot_duration + travel_buffer <= first_appt_start:
-                    found_slot = slot_start
-                    # Distance from home (departing at start of day)
-                else:
-                    # Try gaps between existing appointments
-                    for i, appt in enumerate(appointments):
-                        appt_end = appt["end_time"]
-                        if hasattr(appt_end, 'tzinfo') and appt_end.tzinfo is None:
-                            appt_end = appt_end.replace(tzinfo=eastern)
+            blocked_slot = None
 
-                        candidate_start = appt_end + travel_buffer
+            if is_heavy:
+                # Heavy job: find first pair of consecutive free main slots
+                for i in range(len(main_slots) - 1):
+                    s1, s2 = main_slots[i], main_slots[i + 1]
+                    if not _slot_conflicts(s1, appointments) and not _slot_conflicts(s2, appointments):
+                        found_slot = s1
+                        blocked_slot = s2
+                        depart_from_lat, depart_from_lon = _departure_point(s1, appointments)
+                        logging.info(
+                            "[AVAILABILITY] Tech %s: heavy job %s + %s blocked",
+                            tech["name"], s1.strftime("%I:%M %p"), s2.strftime("%I:%M %p"),
+                        )
+                        break
+            else:
+                # Standard: try main slots in preference order
+                for slot in slot_order:
+                    if not _slot_conflicts(slot, appointments):
+                        found_slot = slot
+                        depart_from_lat, depart_from_lon = _departure_point(slot, appointments)
+                        logging.info(
+                            "[AVAILABILITY] Tech %s: main slot %s free",
+                            tech["name"], found_slot.strftime("%I:%M %p"),
+                        )
+                        break
 
-                        # Check if this slot fits before the next appointment
-                        if i + 1 < len(appointments):
-                            next_start = appointments[i + 1]["start_time"]
-                            if hasattr(next_start, 'tzinfo') and next_start.tzinfo is None:
-                                next_start = next_start.replace(tzinfo=eastern)
-                            if candidate_start + slot_duration + travel_buffer <= next_start:
-                                found_slot = candidate_start
-                                # Departing from this appointment's job site
-                                depart_from_lat = float(appt["latitude"])
-                                depart_from_lon = float(appt["longitude"])
-                                break
-                        else:
-                            # After last appointment
-                            if candidate_start + slot_duration <= business_end:
-                                found_slot = candidate_start
-                                depart_from_lat = float(appt["latitude"])
-                                depart_from_lon = float(appt["longitude"])
+                # Overflow: all 4 main slots taken -> try 11am then 1pm
+                if not found_slot:
+                    taken = sum(1 for s in main_slots if _slot_conflicts(s, appointments))
+                    if taken >= len(FIXED_SLOTS):
+                        for slot in overflow_slots:
+                            if not _slot_conflicts(slot, appointments):
+                                found_slot = slot
+                                depart_from_lat, depart_from_lon = _departure_point(slot, appointments)
+                                logging.info(
+                                    "[AVAILABILITY] Tech %s: overflow slot %s",
+                                    tech["name"], found_slot.strftime("%I:%M %p"),
+                                )
                                 break
 
             if not found_slot:
@@ -393,7 +454,17 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 )
                 continue
 
-            # Step 4: Calculate distance from departure point to customer
+            # Step 4: Check admin calendar for conflicts at this slot (non-fatal)
+            from src.utils.calendar_conflict import check_admin_calendar_conflict
+            slot_end = found_slot + timedelta(minutes=service_duration)
+            if check_admin_calendar_conflict(found_slot, slot_end):
+                logging.info(
+                    "[AVAILABILITY] Tech %s: slot %s blocked by admin calendar, skipping",
+                    tech["name"], found_slot.strftime("%I:%M %p"),
+                )
+                continue
+
+            # Step 5: Calculate distance from departure point to customer
             distance = calculate_distance(
                 depart_from_lat, depart_from_lon,
                 request.confirmed_latitude, request.confirmed_longitude,
@@ -417,6 +488,7 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 "tech": tech,
                 "slot": found_slot,
                 "distance": distance,
+                "blocked_slot": blocked_slot,
             })
 
         if not candidates:
@@ -493,6 +565,47 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
             discount_applied=request.discount_applied,
         )
 
+        # Heavy job: block the next fixed slot for this technician
+        if request.job_units:
+            from src.utils.db import get_job_scope_rules
+            _rules = get_job_scope_rules()
+            _is_heavy = (
+                request.service_type in _rules
+                and request.job_units >= _rules[request.service_type]["units_threshold"]
+            )
+            if _is_heavy:
+                eastern = ZoneInfo("America/New_York")
+                appt_date = request.start_time.date()
+                all_fixed = [
+                    datetime(appt_date.year, appt_date.month, appt_date.day, h, m, tzinfo=eastern)
+                    for h, m in FIXED_SLOTS
+                ]
+                next_slots = [s for s in all_fixed if s > request.start_time]
+                if next_slots:
+                    blocked_start = min(next_slots)
+                    blocked_end = blocked_start + timedelta(minutes=request.duration_minutes)
+                    insert_appointment(
+                        calendar_event_id=str(uuid.uuid4()),
+                        technician_id=request.technician_id,
+                        customer_name=request.customer_name,
+                        customer_phone=request.customer_phone,
+                        customer_email=request.customer_email,
+                        service_type=request.service_type,
+                        address=request.address,
+                        latitude=request.latitude,
+                        longitude=request.longitude,
+                        start_time=blocked_start,
+                        end_time=blocked_end,
+                        duration_minutes=request.duration_minutes,
+                        status="blocked",
+                        quoted_price=None,
+                        discount_applied=None,
+                    )
+                    logging.info(
+                        "[BOOKING] Blocked second slot %s for heavy job (tech %d)",
+                        blocked_start.strftime("%I:%M %p"), request.technician_id,
+                    )
+
         delete_route_cache(request.technician_id, request.start_time.date())
 
         # Push event to technician's connected Google or Outlook calendar (non-fatal)
@@ -524,6 +637,7 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                         description=event_description,
                         location=request.address,
                         attendees=attendees,
+                        color_id=tech.get("calendar_color_id"),
                     )
                     save_calendar_credentials(
                         request.technician_id, "google",
@@ -582,6 +696,7 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                         description=admin_event_description,
                         location=request.address,
                         attendees=attendees,
+                        color_id=tech.get("calendar_color_id"),
                     )
                     save_admin_calendar_credentials(
                         "google",

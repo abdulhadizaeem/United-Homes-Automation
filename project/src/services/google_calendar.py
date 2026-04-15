@@ -72,7 +72,8 @@ class GoogleCalendarService:
             return True
 
     def create_event(self, summary: str, start_datetime: datetime, end_datetime: datetime,
-                     description: str = '', location: str = '', attendees: List[str] = None):
+                     description: str = '', location: str = '', attendees: List[str] = None,
+                     color_id: str = None):
         try:
             event = {
                 "summary": summary,
@@ -87,6 +88,8 @@ class GoogleCalendarService:
                     "timeZone": "America/New_York"
                 }
             }
+            if color_id:
+                event["colorId"] = str(color_id)
             if attendees:
                 event["attendees"] = [{"email": email} for email in attendees]
             created = self.service.events().insert(

@@ -15,6 +15,7 @@ from src.api import (
     auth as auth_router,
     calendar as calendar_router,
     call_logs,
+    job_scope_rules,
     retell_webhooks,
     technicians,
     webhooks,
@@ -33,7 +34,7 @@ def send_daily_schedules():
     tomorrow_start = datetime.combine(tomorrow, datetime.min.time())
     tomorrow_end = datetime.combine(tomorrow, datetime.max.time())
     frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-    schedule_url = f"{frontend_url}/schedule"
+    schedule_url = f"{frontend_url}/signin"
 
     techs = get_all_technicians()
     logging.info(
@@ -137,6 +138,11 @@ app.include_router(technicians.router, prefix="/api/technicians", tags=["technic
 app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(retell_webhooks.router, prefix="/api/webhooks", tags=["retell-webhooks"])
 app.include_router(call_logs.router, prefix="/api/call-logs", tags=["call-logs"])
+app.include_router(
+    job_scope_rules.router,
+    prefix="/api/admin/job-scope-rules",
+    tags=["admin"],
+)
 
 
 @app.get("/")
