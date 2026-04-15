@@ -416,13 +416,13 @@ def _next_tech_color(cur):
     unless there are more techs than available colors (then wraps).
     """
     cur.execute("SELECT calendar_color_id FROM technicians WHERE calendar_color_id IS NOT NULL")
-    used = {row[0] for row in cur.fetchall()}
+    used = {row["calendar_color_id"] for row in cur.fetchall()}
     for color in _TECH_COLORS:
         if color not in used:
             return color
     # All colors taken — fall back to cycling by count
-    cur.execute("SELECT COUNT(*) FROM technicians")
-    count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) AS count FROM technicians")
+    count = cur.fetchone()["count"]
     return _TECH_COLORS[count % len(_TECH_COLORS)]
 
 
