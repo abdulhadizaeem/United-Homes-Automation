@@ -404,6 +404,28 @@ def get_all_users_paginated(page=1, page_size=20, search=None):
         conn.close()
 
 
+# Google Calendar color IDs — ordered for maximum visual contrast
+_TECH_COLORS = ['9', '11', '10', '6', '3', '1', '4', '2', '7']
+
+
+def _next_tech_color(cur):
+    """Return the first color ID not yet assigned to any technician.
+
+    Uses the open cursor (inside an active transaction) to check existing
+    assignments. Cycles through _TECH_COLORS so no two techs share a color
+    unless there are more techs than available colors (then wraps).
+    """
+    cur.execute("SELECT calendar_color_id FROM technicians WHERE calendar_color_id IS NOT NULL")
+    used = {row[0] for row in cur.fetchall()}
+    for color in _TECH_COLORS:
+        if color not in used:
+            return color
+    # All colors taken — fall back to cycling by count
+    cur.execute("SELECT COUNT(*) FROM technicians")
+    count = cur.fetchone()[0]
+    return _TECH_COLORS[count % len(_TECH_COLORS)]
+
+
 def create_user_by_admin(user_data, temp_password):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -453,8 +475,9 @@ def create_user_by_admin(user_data, temp_password):
 
             cur.execute("""
                 INSERT INTO technicians
-                (user_id, name, email, phone, skills, home_latitude, home_longitude, home_address, max_radius_miles, status)
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, 'active')
+                (user_id, name, email, phone, skills, home_latitude, home_longitude,
+                 home_address, max_radius_miles, status, calendar_color_id)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, 'active', %s)
                 RETURNING id
             """, (
                 user["id"],
@@ -465,7 +488,8 @@ def create_user_by_admin(user_data, temp_password):
                 user_data.get("home_latitude"),
                 user_data.get("home_longitude"),
                 user_data.get("home_address"),
-                50
+                50,
+                _next_tech_color(cur),
             ))
             tech_id = cur.fetchone()
             logging.info(f"[USER CREATE] Created technician id={tech_id['id'] if tech_id else 'unknown'} for user {user['id']}")
