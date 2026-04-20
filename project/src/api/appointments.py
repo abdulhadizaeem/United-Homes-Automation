@@ -454,17 +454,7 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 )
                 continue
 
-            # Step 4: Check admin calendar for conflicts at this slot (non-fatal)
-            from src.utils.calendar_conflict import check_admin_calendar_conflict
-            slot_end = found_slot + timedelta(minutes=service_duration)
-            if check_admin_calendar_conflict(found_slot, slot_end):
-                logging.info(
-                    "[AVAILABILITY] Tech %s: slot %s blocked by admin calendar, skipping",
-                    tech["name"], found_slot.strftime("%I:%M %p"),
-                )
-                continue
-
-            # Step 5: Calculate distance from departure point to customer
+            # Step 4: Calculate distance from departure point to customer
             distance = calculate_distance(
                 depart_from_lat, depart_from_lon,
                 request.confirmed_latitude, request.confirmed_longitude,

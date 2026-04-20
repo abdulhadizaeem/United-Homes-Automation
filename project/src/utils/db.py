@@ -39,12 +39,13 @@ def create_tables():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS technicians (
             id SERIAL PRIMARY KEY,
+            ghl_user_id VARCHAR(255),
+            ghl_calendar_id VARCHAR(255),
             user_id INTEGER REFERENCES users(id),
             name VARCHAR(255),
             email VARCHAR(255),
             phone VARCHAR(50),
             skills JSONB,
-            home_address VARCHAR(500),
             home_latitude DECIMAL(10, 8),
             home_longitude DECIMAL(11, 8),
             max_radius_miles INTEGER DEFAULT 20,
@@ -72,8 +73,6 @@ def create_tables():
             start_time TIMESTAMP,
             end_time TIMESTAMP,
             duration_minutes INTEGER DEFAULT 60,
-            quoted_price DECIMAL(10, 2),
-            discount_applied VARCHAR(100),
             status VARCHAR(50) DEFAULT 'scheduled',
             notes TEXT,
             reminder_sent BOOLEAN DEFAULT FALSE,
@@ -134,37 +133,6 @@ def create_tables():
         )
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_calendar_config (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            provider VARCHAR(50),
-            email VARCHAR(255),
-            credentials JSONB,
-            connected BOOLEAN DEFAULT FALSE,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS job_scope_rules (
-            id SERIAL PRIMARY KEY,
-            service_type VARCHAR(100) UNIQUE NOT NULL,
-            units_threshold INTEGER NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Seed defaults only if table is empty
-    cur.execute("SELECT COUNT(*) FROM job_scope_rules")
-    if cur.fetchone()[0] == 0:
-        cur.execute("""
-            INSERT INTO job_scope_rules (service_type, units_threshold) VALUES
-            ('air_duct', 3),
-            ('chimney', 4),
-            ('power_washing', 2)
-            ON CONFLICT (service_type) DO NOTHING
-        """)
-
     _ensure_schema_migration(cur)
 
     conn.commit()
@@ -172,54 +140,6 @@ def create_tables():
     conn.close()
 
     _seed_admin_user()
-
-
-def save_admin_calendar_credentials(provider, email, creds_dict):
-    import json
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO admin_calendar_config (id, provider, email, credentials, connected, updated_at)
-            VALUES (1, %s, %s, %s, TRUE, CURRENT_TIMESTAMP)
-            ON CONFLICT (id) DO UPDATE SET
-                provider = EXCLUDED.provider,
-                email = EXCLUDED.email,
-                credentials = EXCLUDED.credentials,
-                connected = TRUE,
-                updated_at = CURRENT_TIMESTAMP
-        """, (provider, email, json.dumps(creds_dict)))
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def get_admin_calendar_credentials():
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cur.execute("SELECT * FROM admin_calendar_config WHERE id = 1")
-        row = cur.fetchone()
-        return dict(row) if row else None
-    finally:
-        cur.close()
-        conn.close()
-
-
-def disconnect_admin_calendar():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            UPDATE admin_calendar_config
-            SET connected = FALSE, credentials = NULL, provider = NULL, email = NULL
-            WHERE id = 1
-        """)
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
 
 
 def _ensure_schema_migration(cur):
@@ -230,13 +150,8 @@ def _ensure_schema_migration(cur):
             ("calendar_email", "VARCHAR(255)"),
             ("calendar_credentials", "JSONB"),
             ("calendar_connected", "BOOLEAN DEFAULT FALSE"),
-            ("home_address", "VARCHAR(500)"),
             ("calendar_color_id", "VARCHAR(5) DEFAULT '7'"),
-        ],
-        "appointments": [
-            ("quoted_price", "DECIMAL(10, 2)"),
-            ("discount_applied", "VARCHAR(100)"),
-        ],
+        ]
     }
     for table, columns in columns_to_add.items():
         for col_name, col_type in columns:
@@ -247,6 +162,22 @@ def _ensure_schema_migration(cur):
                 """)
             except Exception:
                 pass
+
+    # job_scope_rules table for heavy-job double-slot logic
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS job_scope_rules (
+                service_type VARCHAR(100) PRIMARY KEY,
+                units_threshold INTEGER NOT NULL
+            )
+        """)
+        cur.execute("""
+            INSERT INTO job_scope_rules (service_type, units_threshold)
+            VALUES ('air_duct', 3), ('chimney', 4), ('power_washing', 2)
+            ON CONFLICT (service_type) DO NOTHING
+        """)
+    except Exception:
+        pass
 
 
 def _seed_admin_user():
@@ -259,12 +190,7 @@ def _seed_admin_user():
             conn.close()
             return
         admin_email = os.getenv("ADMIN_EMAIL", "admin@unitedhomeservices.com")
-        admin_password = os.getenv("ADMIN_PASSWORD")
-        if not admin_password:
-            logging.warning("ADMIN_PASSWORD not set in .env -- skipping admin seed")
-            cur.close()
-            conn.close()
-            return
+        admin_password = os.getenv("ADMIN_PASSWORD", "admin123456")
         hashed = bcrypt.hashpw(admin_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         cur.execute("""
             INSERT INTO users (username, email, password_hash, first_name, is_admin)
@@ -361,7 +287,7 @@ def get_all_users_paginated(page=1, page_size=20, search=None):
                        u.phone, u.is_admin, u.is_active, u.created_at,
                        t.id as technician_id, t.skills, t.calendar_connected,
                        t.calendar_provider, t.calendar_email,
-                       t.home_address, t.home_latitude, t.home_longitude, t.status as tech_status
+                       t.home_latitude, t.home_longitude, t.status as tech_status
                 FROM users u
                 LEFT JOIN technicians t ON t.user_id = u.id
                 WHERE u.username ILIKE %s OR u.email ILIKE %s
@@ -376,7 +302,7 @@ def get_all_users_paginated(page=1, page_size=20, search=None):
                        u.phone, u.is_admin, u.is_active, u.created_at,
                        t.id as technician_id, t.skills, t.calendar_connected,
                        t.calendar_provider, t.calendar_email,
-                       t.home_address, t.home_latitude, t.home_longitude, t.status as tech_status
+                       t.home_latitude, t.home_longitude, t.status as tech_status
                 FROM users u
                 LEFT JOIN technicians t ON t.user_id = u.id
                 ORDER BY u.created_at DESC
@@ -404,28 +330,6 @@ def get_all_users_paginated(page=1, page_size=20, search=None):
         conn.close()
 
 
-# Google Calendar color IDs — ordered for maximum visual contrast
-_TECH_COLORS = ['9', '11', '10', '6', '3', '1', '4', '2', '7']
-
-
-def _next_tech_color(cur):
-    """Return the first color ID not yet assigned to any technician.
-
-    Uses the open cursor (inside an active transaction) to check existing
-    assignments. Cycles through _TECH_COLORS so no two techs share a color
-    unless there are more techs than available colors (then wraps).
-    """
-    cur.execute("SELECT calendar_color_id FROM technicians WHERE calendar_color_id IS NOT NULL")
-    used = {row["calendar_color_id"] for row in cur.fetchall()}
-    for color in _TECH_COLORS:
-        if color not in used:
-            return color
-    # All colors taken — fall back to cycling by count
-    cur.execute("SELECT COUNT(*) AS count FROM technicians")
-    count = cur.fetchone()["count"]
-    return _TECH_COLORS[count % len(_TECH_COLORS)]
-
-
 def create_user_by_admin(user_data, temp_password):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -433,18 +337,6 @@ def create_user_by_admin(user_data, temp_password):
         cur.execute("SELECT id FROM users WHERE email = %s", (user_data["email"],))
         if cur.fetchone():
             raise ValueError("Email already registered")
-
-        # Auto-generate username from email, deduplicate with suffix if needed
-        base_username = user_data["email"].split("@")[0].lower()
-        username = base_username
-        suffix = 2
-        while True:
-            cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-            if not cur.fetchone():
-                break
-            username = f"{base_username}_{suffix}"
-            suffix += 1
-
         hashed = bcrypt.hashpw(
             temp_password.encode("utf-8"),
             bcrypt.gensalt()
@@ -454,7 +346,7 @@ def create_user_by_admin(user_data, temp_password):
             VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id, username, email, first_name, last_name, phone, created_at
         """, (
-            username,
+            user_data["username"],
             user_data["email"],
             hashed,
             user_data.get("first_name"),
@@ -464,35 +356,21 @@ def create_user_by_admin(user_data, temp_password):
         user = cur.fetchone()
 
         if user and user_data.get("skills"):
-            raw_skills = user_data["skills"]
-            normalized = []
-            for s in raw_skills:
-                parts = [p.strip().lower() for p in s.split(",") if p.strip()]
-                normalized.extend(parts)
-            skills_json = json.dumps(normalized)
-            tech_name = f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip() or username
-            logging.info(f"[USER CREATE] Creating tech for user {user['id']} with skills: {normalized}")
-
+            skills_json = json.dumps(user_data["skills"])
             cur.execute("""
                 INSERT INTO technicians
-                (user_id, name, email, phone, skills, home_latitude, home_longitude,
-                 home_address, max_radius_miles, status, calendar_color_id)
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, 'active', %s)
+                (user_id, name, email, phone, skills, home_latitude, home_longitude, status)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, 'active')
                 RETURNING id
             """, (
                 user["id"],
-                tech_name,
+                f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip() or user_data["username"],
                 user_data["email"],
                 user_data.get("phone"),
                 skills_json,
                 user_data.get("home_latitude"),
-                user_data.get("home_longitude"),
-                user_data.get("home_address"),
-                50,
-                _next_tech_color(cur),
+                user_data.get("home_longitude")
             ))
-            tech_id = cur.fetchone()
-            logging.info(f"[USER CREATE] Created technician id={tech_id['id'] if tech_id else 'unknown'} for user {user['id']}")
 
         conn.commit()
         return dict(user) if user else None
@@ -584,8 +462,7 @@ def get_user_detail_with_calendar(user_id):
             SELECT u.id, u.username, u.email, u.first_name, u.last_name,
                    u.phone, u.is_admin, u.created_at,
                    t.id as technician_id, t.skills, t.calendar_connected,
-                   t.calendar_provider, t.calendar_email,
-                   t.home_address, t.home_latitude, t.home_longitude
+                   t.calendar_provider, t.calendar_email
             FROM users u
             LEFT JOIN technicians t ON t.user_id = u.id
             WHERE u.id = %s
@@ -607,113 +484,21 @@ def update_user(user_id, updates):
             if key in updates and updates[key] is not None:
                 user_fields[key] = updates[key]
         if "skills" in updates:
-            # Normalize skills: split comma-separated strings, trim, lowercase
-            raw_skills = updates["skills"]
-            normalized = []
-            for s in raw_skills:
-                parts = [p.strip().lower() for p in s.split(",") if p.strip()]
-                normalized.extend(parts)
-            tech_fields["skills"] = json.dumps(normalized)
-
-        # Handle address update: geocode and store in technicians table
-        if "address" in updates and updates["address"]:
-            tech_fields["home_address"] = updates["address"]
-            try:
-                from src.utils.radar import geocode_address
-                geo = geocode_address(updates["address"])
-                if geo and geo.get("latitude") and geo.get("longitude"):
-                    tech_fields["home_latitude"] = geo["latitude"]
-                    tech_fields["home_longitude"] = geo["longitude"]
-                    # Use the formatted address from geocoder if available
-                    if geo.get("formatted_address"):
-                        tech_fields["home_address"] = geo["formatted_address"]
-                    logging.info(
-                        "[USER UPDATE] Geocoded address for user %s: %s -> (%s, %s)",
-                        user_id, updates["address"],
-                        tech_fields["home_latitude"], tech_fields["home_longitude"],
-                    )
-                else:
-                    logging.warning(
-                        "[USER UPDATE] Geocoding failed for user %s address: %s",
-                        user_id, updates["address"],
-                    )
-            except Exception as e:
-                logging.error("[USER UPDATE] Geocode error for user %s: %s", user_id, e)
+            tech_fields["skills"] = json.dumps(updates["skills"])
 
         if user_fields:
             set_clause = ", ".join(f"{k} = %s" for k in user_fields)
             values = list(user_fields.values()) + [user_id]
             cur.execute(f"UPDATE users SET {set_clause} WHERE id = %s", values)
 
-        # If tech fields were provided (skills or address), upsert the technician row
         if tech_fields:
             cur.execute("SELECT id FROM technicians WHERE user_id = %s", (user_id,))
             tech = cur.fetchone()
             if tech:
-                # Update existing tech row
-                set_clause = ", ".join(f"{k} = %s" for k in tech_fields)
-                values = list(tech_fields.values()) + [user_id]
-                # Handle jsonb casting for skills
-                set_parts = []
-                vals = []
-                for k, v in tech_fields.items():
-                    if k == "skills":
-                        set_parts.append(f"{k} = %s::jsonb")
-                    else:
-                        set_parts.append(f"{k} = %s")
-                    vals.append(v)
-                vals.append(user_id)
                 cur.execute(
-                    f"UPDATE technicians SET {', '.join(set_parts)} WHERE user_id = %s",
-                    vals,
+                    "UPDATE technicians SET skills = %s::jsonb WHERE user_id = %s",
+                    (tech_fields["skills"], user_id)
                 )
-                logging.info("[USER UPDATE] Updated tech fields for user %s: %s", user_id, list(tech_fields.keys()))
-            else:
-                # No tech row exists - create one
-                cur.execute(
-                    "SELECT username, email, first_name, last_name, phone FROM users WHERE id = %s",
-                    (user_id,)
-                )
-                user_row = cur.fetchone()
-                if user_row:
-                    name = f"{user_row.get('first_name', '') or ''} {user_row.get('last_name', '') or ''}".strip()
-                    name = name or user_row["username"]
-                    cur.execute("""
-                        INSERT INTO technicians
-                        (user_id, name, email, phone, skills, home_address,
-                         home_latitude, home_longitude, max_radius_miles, status)
-                        VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, 'active')
-                    """, (
-                        user_id, name, user_row["email"], user_row.get("phone"),
-                        tech_fields.get("skills", "[]"),
-                        tech_fields.get("home_address"),
-                        tech_fields.get("home_latitude"),
-                        tech_fields.get("home_longitude"),
-                        50,
-                    ))
-                    logging.info("[USER UPDATE] Created new tech row for user %s", user_id)
-
-        # Sync name/phone changes to technicians table
-        if user_fields and any(k in user_fields for k in ["first_name", "last_name", "phone"]):
-            cur.execute("SELECT id FROM technicians WHERE user_id = %s", (user_id,))
-            tech = cur.fetchone()
-            if tech:
-                sync_updates = {}
-                if "first_name" in user_fields or "last_name" in user_fields:
-                    cur.execute(
-                        "SELECT first_name, last_name, username FROM users WHERE id = %s",
-                        (user_id,)
-                    )
-                    u = cur.fetchone()
-                    if u:
-                        name = f"{u.get('first_name', '') or ''} {u.get('last_name', '') or ''}".strip()
-                        sync_updates["name"] = name or u["username"]
-                if "phone" in user_fields:
-                    sync_updates["phone"] = user_fields["phone"]
-                if sync_updates:
-                    set_clause = ", ".join(f"{k} = %s" for k in sync_updates)
-                    values = list(sync_updates.values()) + [user_id]
-                    cur.execute(f"UPDATE technicians SET {set_clause} WHERE user_id = %s", values)
 
         conn.commit()
         return get_user_detail_with_calendar(user_id)
@@ -981,185 +766,111 @@ def get_technician_by_user_id(user_id):
 
 
 def get_techs_with_skill(service_type):
-    """Find technicians with a matching skill. Uses fuzzy matching to handle
-    variations like 'chimney', 'chimney cleaning', 'Chimney Cleaning', etc."""
-    import logging
-
-    # Normalize service type to lowercase keyword
-    service_lower = service_type.lower().strip()
-
-    # Map common variations to canonical service keywords
-    service_keywords = {
-        "chimney": ["chimney"],
-        "chimney cleaning": ["chimney"],
-        "dryer_vent": ["dryer", "vent"],
-        "dryer vent": ["dryer", "vent"],
-        "dryer vent cleaning": ["dryer", "vent"],
-        "gutter": ["gutter"],
-        "gutter cleaning": ["gutter"],
-        "power_washing": ["power", "wash", "pressure"],
-        "power washing": ["power", "wash", "pressure"],
-        "pressure washing": ["power", "wash", "pressure"],
-        "air_duct": ["duct", "air"],
-        "air duct": ["duct", "air"],
-        "air duct cleaning": ["duct", "air"],
-        "duct cleaning": ["duct", "air"],
-    }
-
-    # Get the keywords to match against
-    match_keywords = service_keywords.get(service_lower, [service_lower.split()[0] if service_lower else service_lower])
-
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # First try: exact JSONB match
         cur.execute("""
             SELECT * FROM technicians
             WHERE status = 'active'
             AND skills @> %s::jsonb
         """, (f'["{service_type}"]',))
-        results = [dict(tech) for tech in cur.fetchall()]
-
-        if results:
-            logging.info(f"[SKILL MATCH] Exact match for '{service_type}': found {len(results)} techs: {[t['name'] for t in results]}")
-            return results
-
-        # Second try: case-insensitive text search in skills array
-        keyword_conditions = " OR ".join(["skills::text ILIKE %s" for _ in match_keywords])
-        keyword_params = [f'%{kw}%' for kw in match_keywords]
-
-        cur.execute(f"""
-            SELECT * FROM technicians
-            WHERE status = 'active'
-            AND ({keyword_conditions})
-        """, keyword_params)
-        results = [dict(tech) for tech in cur.fetchall()]
-
-        if results:
-            logging.info(f"[SKILL MATCH] Fuzzy match for '{service_type}' (keywords: {match_keywords}): found {len(results)} techs: {[t['name'] for t in results]}")
-            return results
-
-        # Fallback: return ALL active techs (better to suggest someone than no one)
-        logging.warning(f"[SKILL MATCH] No skill match for '{service_type}'. Falling back to ALL active techs.")
-        cur.execute("SELECT * FROM technicians WHERE status = 'active'")
-        results = [dict(tech) for tech in cur.fetchall()]
-        logging.info(f"[SKILL MATCH] Fallback: returning {len(results)} active techs: {[t['name'] for t in results]}")
-        return results
+        return [dict(tech) for tech in cur.fetchall()]
     finally:
         cur.close()
         conn.close()
 
 
-
 def get_techs_with_appointments_for_day(service_type, date):
-    service_lower = service_type.lower().strip()
+    """Return active, non-admin technicians with the given skill.
 
-    service_keywords = {
-        "chimney": ["chimney"],
-        "chimney cleaning": ["chimney"],
-        "dryer_vent": ["dryer", "vent"],
-        "dryer vent": ["dryer", "vent"],
-        "dryer vent cleaning": ["dryer", "vent"],
-        "gutter": ["gutter"],
-        "gutter cleaning": ["gutter"],
-        "power_washing": ["power", "wash", "pressure"],
-        "power washing": ["power", "wash", "pressure"],
-        "pressure washing": ["power", "wash", "pressure"],
-        "air_duct": ["duct", "air"],
-        "air duct": ["duct", "air"],
-        "air duct cleaning": ["duct", "air"],
-        "duct cleaning": ["duct", "air"],
-    }
-
-    match_keywords = service_keywords.get(
-        service_lower,
-        [service_lower.split()[0] if service_lower else service_lower],
-    )
-
+    Each tech dict includes an 'appointments' list for `date`.
+    Filters:
+      - technicians.status = 'active'
+      - users.is_admin = FALSE  (prevents admin from being assigned jobs)
+      - skills JSONB contains service_type
+    """
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        keyword_conditions = " OR ".join(
-            ["t.skills::text ILIKE %s" for _ in match_keywords]
-        )
-        keyword_params = [f"%{kw}%" for kw in match_keywords]
-
-        cur.execute(
-            f"""
+        cur.execute("""
             SELECT
                 t.id, t.name, t.email, t.phone, t.skills,
-                t.home_address, t.home_latitude, t.home_longitude,
-                t.max_radius_miles, t.status,
-                t.calendar_provider, t.calendar_email, t.calendar_connected,
-                a.id          AS appt_id,
-                a.start_time  AS appt_start_time,
-                a.end_time    AS appt_end_time,
-                a.latitude    AS appt_latitude,
-                a.longitude   AS appt_longitude
+                t.home_latitude, t.home_longitude, t.home_address,
+                t.max_radius_miles, t.status, t.calendar_color_id,
+                t.calendar_connected, t.calendar_provider,
+                t.calendar_credentials, t.calendar_email,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'id', a.id,
+                            'start_time', a.start_time,
+                            'end_time', a.end_time,
+                            'latitude', a.latitude,
+                            'longitude', a.longitude,
+                            'status', a.status
+                        )
+                    ) FILTER (WHERE a.id IS NOT NULL),
+                    '[]'
+                ) AS appointments
             FROM technicians t
+            INNER JOIN users u ON u.id = t.user_id
             LEFT JOIN appointments a
                 ON a.technician_id = t.id
                AND DATE(a.start_time) = %s
-               AND a.status = 'scheduled'
+               AND a.status IN ('scheduled', 'blocked')
             WHERE t.status = 'active'
-              AND (
-                  t.skills @> %s::jsonb
-                  OR ({keyword_conditions})
-              )
-            ORDER BY t.id, a.start_time
-            """,
-            [date, f'["{service_type}"]'] + keyword_params,
-        )
+              AND u.is_admin = FALSE
+              AND t.skills @> %s::jsonb
+            GROUP BY
+                t.id, t.name, t.email, t.phone, t.skills,
+                t.home_latitude, t.home_longitude, t.home_address,
+                t.max_radius_miles, t.status, t.calendar_color_id,
+                t.calendar_connected, t.calendar_provider,
+                t.calendar_credentials, t.calendar_email
+        """, (date, f'["{service_type}"]'))
         rows = cur.fetchall()
-
-        if not rows:
-            logging.warning(
-                "[SKILL MATCH] No skill match for '%s'. Falling back to all active techs.",
-                service_type,
-            )
-            cur.execute(
-                """
-                SELECT
-                    t.id, t.name, t.email, t.phone, t.skills,
-                    t.home_address, t.home_latitude, t.home_longitude,
-                    t.max_radius_miles, t.status,
-                    t.calendar_provider, t.calendar_email, t.calendar_connected,
-                    a.id          AS appt_id,
-                    a.start_time  AS appt_start_time,
-                    a.end_time    AS appt_end_time,
-                    a.latitude    AS appt_latitude,
-                    a.longitude   AS appt_longitude
-                FROM technicians t
-                LEFT JOIN appointments a
-                    ON a.technician_id = t.id
-                   AND DATE(a.start_time) = %s
-                   AND a.status = 'scheduled'
-                WHERE t.status = 'active'
-                ORDER BY t.id, a.start_time
-                """,
-                (date,),
-            )
-            rows = cur.fetchall()
-
-        tech_map = {}
+        result = []
         for row in rows:
-            row = dict(row)
-            tid = row["id"]
-            if tid not in tech_map:
-                tech_map[tid] = {k: v for k, v in row.items() if not k.startswith("appt_")}
-                tech_map[tid]["appointments"] = []
-            if row["appt_id"] is not None:
-                tech_map[tid]["appointments"].append({
-                    "start_time": row["appt_start_time"],
-                    "end_time": row["appt_end_time"],
-                    "latitude": row["appt_latitude"],
-                    "longitude": row["appt_longitude"],
-                })
+            tech = dict(row)
+            appts = tech.get("appointments") or []
+            if isinstance(appts, str):
+                import json as _j
+                appts = _j.loads(appts)
+            tech["appointments"] = appts
+            result.append(tech)
+        return result
+    finally:
+        cur.close()
+        conn.close()
 
-        logging.info(
-            "[SKILL MATCH] Single-query found %d techs for '%s'", len(tech_map), service_type
-        )
-        return list(tech_map.values())
+
+def get_job_scope_rules():
+    """Return {service_type: {units_threshold: int}}."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT service_type, units_threshold FROM job_scope_rules")
+        return {row["service_type"]: {"units_threshold": row["units_threshold"]}
+                for row in cur.fetchall()}
+    except Exception:
+        return {}
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_job_scope_rule(service_type, units_threshold):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO job_scope_rules (service_type, units_threshold)
+            VALUES (%s, %s)
+            ON CONFLICT (service_type) DO UPDATE
+                SET units_threshold = EXCLUDED.units_threshold
+        """, (service_type, units_threshold))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         cur.close()
         conn.close()
@@ -1176,40 +887,6 @@ def get_tech_appointments_for_day(tech_id, date):
             ORDER BY start_time
         """, (tech_id, date))
         return [dict(appt) for appt in cur.fetchall()]
-    finally:
-        cur.close()
-        conn.close()
-
-
-def insert_appointment(calendar_event_id, technician_id, customer_name,
-                       customer_phone, customer_email, service_type, address,
-                       latitude, longitude, start_time, end_time,
-                       duration_minutes, status, quoted_price=None,
-                       discount_applied=None, notes=None):
-    """Insert a new appointment into the MAIN appointments table."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO appointments
-            (calendar_event_id, technician_id, customer_name, customer_phone,
-             customer_email, service_type, address, latitude, longitude,
-             start_time, end_time, duration_minutes, quoted_price,
-             discount_applied, status, notes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (calendar_event_id, technician_id, customer_name, customer_phone,
-              customer_email, service_type, address, latitude, longitude,
-              start_time, end_time, duration_minutes, quoted_price,
-              discount_applied, status, notes))
-        result = cur.fetchone()
-        conn.commit()
-        logging.info(f"[DB] Inserted appointment id={result[0] if result else 'unknown'} price={quoted_price} discount={discount_applied}")
-        return result[0] if result else None
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"[DB] Failed to insert appointment: {e}")
-        raise
     finally:
         cur.close()
         conn.close()
@@ -1482,33 +1159,3 @@ def get_call_stats():
         cur.close()
         conn.close()
 
-
-def get_job_scope_rules():
-    """Return all job scope rules as a dict keyed by service_type."""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cur.execute("SELECT service_type, units_threshold, updated_at FROM job_scope_rules ORDER BY service_type")
-        rows = cur.fetchall()
-        return {r["service_type"]: dict(r) for r in rows}
-    finally:
-        cur.close()
-        conn.close()
-
-
-def update_job_scope_rule(service_type: str, units_threshold: int):
-    """Insert or update a job scope rule threshold."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO job_scope_rules (service_type, units_threshold, updated_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (service_type) DO UPDATE SET
-                units_threshold = EXCLUDED.units_threshold,
-                updated_at = CURRENT_TIMESTAMP
-        """, (service_type, units_threshold))
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
