@@ -78,6 +78,20 @@ async def retell_webhook(request: Request):
             "Injecting current_date for call %s: %s",
             call.get("call_id"), current_date,
         )
+
+        # Sync admin calendar to DB so availability is fresh
+        import threading
+        def _bg_sync():
+            try:
+                from src.api.calendar import run_full_calendar_sync
+                result = run_full_calendar_sync()
+                logging.warning(
+                    "[CALL SYNC] Calendar synced on call start: %s", result,
+                )
+            except Exception as e:
+                logging.warning("[CALL SYNC] Calendar sync failed (non-fatal): %s", e)
+        threading.Thread(target=_bg_sync, daemon=True).start()
+
         return JSONResponse(status_code=200, content={
             "retell_llm_dynamic_variables": {
                 "current_date": current_date,

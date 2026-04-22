@@ -299,3 +299,380 @@ async def list_calendar_events(
         logging.error(f"List events error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to fetch calendar events")
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar Two-Way Sync (Push Notifications)
+# ---------------------------------------------------------------------------
+
+@router.post("/google/webhook")
+async def google_calendar_webhook(request: Request):
+    """Receive push notifications from Google Calendar.
+
+    Google sends a POST here whenever an event is created, updated,
+    or deleted on the watched calendar. We then fetch recent changes
+    and sync them back to our appointments table.
+    """
+    channel_id = request.headers.get("X-Goog-Channel-ID", "")
+    resource_state = request.headers.get("X-Goog-Resource-State", "")
+    resource_id = request.headers.get("X-Goog-Resource-ID", "")
+
+    logging.warning(
+        "[CALENDAR WEBHOOK] state=%s channel=%s resource=%s",
+        resource_state, channel_id, resource_id,
+    )
+
+    # 'sync' is the initial handshake -- just acknowledge
+    if resource_state == "sync":
+        return {"status": "sync acknowledged"}
+
+    # 'exists' means something changed -- fetch and sync
+    if resource_state == "exists":
+        try:
+            _sync_admin_calendar_changes()
+        except Exception as e:
+            logging.error("[CALENDAR WEBHOOK] Sync failed: %s", e)
+
+    return {"status": "ok"}
+
+
+def _sync_admin_calendar_changes():
+    """Fetch recent events from admin calendar and sync to DB."""
+    from src.utils.db import get_admin_calendar_credentials
+    from datetime import datetime, timedelta, timezone
+
+    admin_creds = get_admin_calendar_credentials()
+    if not admin_creds or not admin_creds.get("connected"):
+        logging.warning("[CALENDAR SYNC] Admin calendar not connected, skipping")
+        return
+
+    if admin_creds.get("provider") != "google":
+        return
+
+    cal = GoogleCalendarService(admin_creds["credentials"])
+
+    # Fetch events from the last 1 hour to catch recent changes
+    now = datetime.now(timezone.utc)
+    updated_min = (now - timedelta(hours=1)).isoformat()
+
+    try:
+        events_result = cal.service.events().list(
+            calendarId="primary",
+            updatedMin=updated_min,
+            singleEvents=True,
+            orderBy="updated",
+            maxResults=50,
+            showDeleted=True,
+        ).execute()
+    except Exception as e:
+        logging.error("[CALENDAR SYNC] Failed to list events: %s", e)
+        return
+
+    # Save refreshed token
+    updated_creds = cal.get_updated_credentials()
+    from src.utils.db import save_admin_calendar_credentials
+    try:
+        save_admin_calendar_credentials(updated_creds)
+    except Exception:
+        pass
+
+    events = events_result.get("items", [])
+    logging.warning("[CALENDAR SYNC] Processing %d changed events", len(events))
+
+    from src.utils.db import (
+        get_appointment_by_calendar_event_id,
+        update_appointment_status,
+    )
+
+    for event in events:
+        event_id = event.get("id")
+        status = event.get("status", "confirmed")
+
+        appt = get_appointment_by_calendar_event_id(event_id)
+        if not appt:
+            continue
+
+        if status == "cancelled" and appt["status"] != "cancelled":
+            update_appointment_status(appt["id"], "cancelled")
+            logging.warning(
+                "[CALENDAR SYNC] Appointment %d cancelled via calendar", appt["id"]
+            )
+        elif status == "confirmed" and appt["status"] == "cancelled":
+            update_appointment_status(appt["id"], "scheduled")
+            logging.warning(
+                "[CALENDAR SYNC] Appointment %d re-scheduled via calendar", appt["id"]
+            )
+
+        # Sync time changes
+        if status != "cancelled":
+            start_raw = event.get("start", {}).get("dateTime")
+            end_raw = event.get("end", {}).get("dateTime")
+            if start_raw and end_raw:
+                from dateutil.parser import parse as dt_parse
+                new_start = dt_parse(start_raw)
+                new_end = dt_parse(end_raw)
+                if (str(appt["start_time"]) != str(new_start)
+                        or str(appt["end_time"]) != str(new_end)):
+                    from src.utils.db import update_appointment_times
+                    update_appointment_times(appt["id"], new_start, new_end)
+                    logging.warning(
+                        "[CALENDAR SYNC] Appointment %d rescheduled: %s -> %s",
+                        appt["id"], new_start, new_end,
+                    )
+
+
+@router.post("/google/watch/start")
+async def start_google_watch(current_user: dict = Depends(get_current_user)):
+    """Register a Google Calendar push notification channel for the admin calendar."""
+    import uuid
+
+    admin_user = current_user
+    if not admin_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    from src.utils.db import get_admin_calendar_credentials
+    admin_creds = get_admin_calendar_credentials()
+    if not admin_creds or not admin_creds.get("connected"):
+        raise HTTPException(status_code=400, detail="Admin calendar not connected")
+
+    cal = GoogleCalendarService(admin_creds["credentials"])
+
+    base_url = os.getenv("BASE_URL", "https://aisystem.unitedhomecarolina.com")
+    channel_id = str(uuid.uuid4())
+
+    try:
+        watch_response = cal.service.events().watch(
+            calendarId="primary",
+            body={
+                "id": channel_id,
+                "type": "web_hook",
+                "address": f"{base_url}/api/calendar/google/webhook",
+            },
+        ).execute()
+
+        from src.utils.db import save_calendar_watch_channel
+        save_calendar_watch_channel(
+            channel_id=watch_response["id"],
+            resource_id=watch_response["resourceId"],
+            expiration=watch_response.get("expiration"),
+        )
+
+        logging.warning(
+            "[CALENDAR WATCH] Registered channel=%s, expires=%s",
+            watch_response["id"], watch_response.get("expiration"),
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "channel_id": watch_response["id"],
+                "expiration": watch_response.get("expiration"),
+            },
+        )
+    except Exception as e:
+        logging.error("[CALENDAR WATCH] Failed to register: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to register watch: {e}")
+
+
+@router.post("/google/watch/stop")
+async def stop_google_watch(current_user: dict = Depends(get_current_user)):
+    """Stop the Google Calendar push notification channel."""
+    admin_user = current_user
+    if not admin_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    from src.utils.db import (
+        get_admin_calendar_credentials,
+        get_calendar_watch_channel,
+        delete_calendar_watch_channel,
+    )
+    admin_creds = get_admin_calendar_credentials()
+    if not admin_creds or not admin_creds.get("connected"):
+        raise HTTPException(status_code=400, detail="Admin calendar not connected")
+
+    watch = get_calendar_watch_channel()
+    if not watch:
+        raise HTTPException(status_code=404, detail="No active watch channel")
+
+    cal = GoogleCalendarService(admin_creds["credentials"])
+
+    try:
+        cal.service.channels().stop(body={
+            "id": watch["channel_id"],
+            "resourceId": watch["resource_id"],
+        }).execute()
+    except Exception as e:
+        logging.warning("[CALENDAR WATCH] Stop error (may already be expired): %s", e)
+
+    delete_calendar_watch_channel()
+
+    return JSONResponse(
+        status_code=200,
+        content={"success": True, "message": "Watch channel stopped"},
+    )
+
+
+@router.post("/google/sync")
+async def full_calendar_sync(current_user: dict = Depends(get_current_user)):
+    """Pull all future events from admin calendar into the DB.
+
+    - Skips events already in the DB (matched by Google event ID)
+    - Imports new events as 'scheduled' appointments
+    - Updates times/status on existing events if they changed
+    Call this once after connecting the calendar, or anytime to force a full sync.
+    """
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    result = run_full_calendar_sync()
+    return JSONResponse(status_code=200, content={"success": True, **result})
+
+
+def run_full_calendar_sync():
+    """Core sync logic -- callable from endpoint or scheduler."""
+    from src.utils.db import get_admin_calendar_credentials
+    from datetime import datetime, timedelta, timezone
+
+    admin_creds = get_admin_calendar_credentials()
+    if not admin_creds or not admin_creds.get("connected"):
+        return {"synced": 0, "skipped": 0, "message": "Admin calendar not connected"}
+
+    if admin_creds.get("provider") != "google":
+        return {"synced": 0, "skipped": 0, "message": "Only Google supported"}
+
+    cal = GoogleCalendarService(admin_creds["credentials"])
+
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(days=90)
+
+    try:
+        events_result = cal.service.events().list(
+            calendarId="primary",
+            timeMin=now.isoformat(),
+            timeMax=future.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=500,
+            showDeleted=True,
+        ).execute()
+    except Exception as e:
+        logging.error("[CALENDAR FULL SYNC] Failed to list events: %s", e)
+        return {"synced": 0, "skipped": 0, "error": str(e)}
+
+    # Refresh token
+    updated_creds = cal.get_updated_credentials()
+    from src.utils.db import save_admin_calendar_credentials
+    try:
+        save_admin_calendar_credentials(updated_creds)
+    except Exception:
+        pass
+
+    events = events_result.get("items", [])
+    logging.warning("[CALENDAR FULL SYNC] Found %d future events", len(events))
+
+    from src.utils.db import (
+        get_appointment_by_calendar_event_id,
+        update_appointment_status,
+        update_appointment_times,
+    )
+
+    synced = 0
+    skipped = 0
+
+    for event in events:
+        google_event_id = event.get("id")
+        status = event.get("status", "confirmed")
+
+        existing = get_appointment_by_calendar_event_id(google_event_id)
+
+        if existing:
+            # Update status if changed
+            changed = False
+            if status == "cancelled" and existing["status"] != "cancelled":
+                update_appointment_status(existing["id"], "cancelled")
+                changed = True
+            elif status == "confirmed" and existing["status"] == "cancelled":
+                update_appointment_status(existing["id"], "scheduled")
+                changed = True
+
+            # Update times if changed
+            if status != "cancelled":
+                start_raw = event.get("start", {}).get("dateTime")
+                end_raw = event.get("end", {}).get("dateTime")
+                if start_raw and end_raw:
+                    from dateutil.parser import parse as dt_parse
+                    new_start = dt_parse(start_raw)
+                    new_end = dt_parse(end_raw)
+                    if (str(existing["start_time"]) != str(new_start)
+                            or str(existing["end_time"]) != str(new_end)):
+                        update_appointment_times(existing["id"], new_start, new_end)
+                        changed = True
+
+            if changed:
+                synced += 1
+            else:
+                skipped += 1
+            continue
+
+        # New event not in DB -- import it
+        if status == "cancelled":
+            skipped += 1
+            continue
+
+        start_raw = event.get("start", {}).get("dateTime")
+        end_raw = event.get("end", {}).get("dateTime")
+        if not start_raw or not end_raw:
+            skipped += 1
+            continue
+
+        from dateutil.parser import parse as dt_parse
+        start_dt = dt_parse(start_raw)
+        end_dt = dt_parse(end_raw)
+        duration = int((end_dt - start_dt).total_seconds() / 60)
+
+        summary = event.get("summary", "")
+        description = event.get("description", "")
+
+        # Try to extract customer name from summary (format: "Service - Customer Name")
+        customer_name = "Calendar Import"
+        if " - " in summary:
+            customer_name = summary.split(" - ", 1)[1].strip()
+
+        # Try to extract service type from summary
+        service_type = "other"
+        summary_lower = summary.lower()
+        for svc in ["air_duct", "chimney", "dryer_vent", "gutter", "power_washing"]:
+            if svc.replace("_", " ") in summary_lower or svc in summary_lower:
+                service_type = svc
+                break
+
+        from src.utils.db import insert_appointment
+        try:
+            insert_appointment(
+                calendar_event_id=google_event_id,
+                technician_id=None,
+                customer_name=customer_name,
+                customer_phone=None,
+                customer_email=None,
+                service_type=service_type,
+                address=event.get("location"),
+                latitude=None,
+                longitude=None,
+                start_time=start_dt,
+                end_time=end_dt,
+                duration_minutes=duration,
+                status="scheduled",
+            )
+            synced += 1
+            logging.warning(
+                "[CALENDAR FULL SYNC] Imported: %s at %s", summary, start_dt,
+            )
+        except Exception as e:
+            logging.error("[CALENDAR FULL SYNC] Failed to import event: %s", e)
+            skipped += 1
+
+    logging.warning(
+        "[CALENDAR FULL SYNC] Done: %d synced, %d skipped", synced, skipped,
+    )
+    return {"synced": synced, "skipped": skipped}

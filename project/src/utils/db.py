@@ -151,7 +151,11 @@ def _ensure_schema_migration(cur):
             ("calendar_credentials", "JSONB"),
             ("calendar_connected", "BOOLEAN DEFAULT FALSE"),
             ("calendar_color_id", "VARCHAR(5) DEFAULT '7'"),
-        ]
+        ],
+        "appointments": [
+            ("quoted_price", "DECIMAL(10, 2)"),
+            ("discount_applied", "VARCHAR(100)"),
+        ],
     }
     for table, columns in columns_to_add.items():
         for col_name, col_type in columns:
@@ -541,6 +545,148 @@ def get_calendar_credentials(tech_id):
         conn.close()
 
 
+def get_admin_calendar_credentials():
+    """Get calendar credentials for the admin user's technician record."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT t.calendar_provider AS provider,
+                   t.calendar_email AS email,
+                   t.calendar_credentials AS credentials,
+                   t.calendar_connected AS connected
+            FROM technicians t
+            INNER JOIN users u ON u.id = t.user_id
+            WHERE u.is_admin = TRUE
+              AND t.calendar_connected = TRUE
+            LIMIT 1
+        """)
+        result = cur.fetchone()
+        return dict(result) if result else None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_admin_calendar_credentials(credentials_dict):
+    """Update the admin tech's calendar credentials (after token refresh)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE technicians
+            SET calendar_credentials = %s::jsonb
+            WHERE id = (
+                SELECT t.id FROM technicians t
+                INNER JOIN users u ON u.id = t.user_id
+                WHERE u.is_admin = TRUE
+                LIMIT 1
+            )
+        """, (json.dumps(credentials_dict),))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_calendar_watch_channel(channel_id, resource_id, expiration=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_watch_channels (
+                id SERIAL PRIMARY KEY,
+                channel_id VARCHAR(255) UNIQUE NOT NULL,
+                resource_id VARCHAR(255) NOT NULL,
+                expiration BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("DELETE FROM calendar_watch_channels")
+        cur.execute("""
+            INSERT INTO calendar_watch_channels (channel_id, resource_id, expiration)
+            VALUES (%s, %s, %s)
+        """, (channel_id, resource_id, expiration))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_calendar_watch_channel():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT channel_id, resource_id, expiration
+            FROM calendar_watch_channels
+            ORDER BY created_at DESC LIMIT 1
+        """)
+        result = cur.fetchone()
+        return dict(result) if result else None
+    except Exception:
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_calendar_watch_channel():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM calendar_watch_channels")
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_appointment_by_calendar_event_id(calendar_event_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT * FROM appointments WHERE calendar_event_id = %s
+        """, (calendar_event_id,))
+        result = cur.fetchone()
+        return dict(result) if result else None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_appointment_status(appointment_id, status):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE appointments SET status = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (status, appointment_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_appointment_times(appointment_id, start_time, end_time):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE appointments
+            SET start_time = %s, end_time = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (start_time, end_time, appointment_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        cur.close()
+        conn.close()
+
+
 def disconnect_calendar(tech_id):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -586,6 +732,36 @@ def create_appointment(appointment_data):
             appointment_data.get("duration_minutes", 60),
             appointment_data.get("status", "scheduled"),
             appointment_data.get("notes")
+        ))
+        appt = cur.fetchone()
+        conn.commit()
+        return dict(appt) if appt else None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def insert_appointment(calendar_event_id, technician_id, customer_name,
+                       customer_phone, customer_email, service_type,
+                       address, latitude, longitude, start_time, end_time,
+                       duration_minutes, status, quoted_price=None,
+                       discount_applied=None):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            INSERT INTO appointments
+            (calendar_event_id, technician_id, customer_name, customer_phone,
+             customer_email, service_type, address, latitude, longitude,
+             start_time, end_time, duration_minutes, status,
+             quoted_price, discount_applied)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            calendar_event_id, technician_id, customer_name, customer_phone,
+            customer_email, service_type, address, latitude, longitude,
+            start_time, end_time, duration_minutes, status,
+            quoted_price, discount_applied,
         ))
         appt = cur.fetchone()
         conn.commit()
@@ -792,6 +968,29 @@ def get_techs_with_appointments_for_day(service_type, date):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        # DEBUG: dump all techs so we can see what's in the table
+        cur.execute("""
+            SELECT t.id, t.name, t.status, t.skills, t.user_id,
+                   t.home_latitude, t.home_longitude,
+                   u.is_admin
+            FROM technicians t
+            LEFT JOIN users u ON u.id = t.user_id
+        """)
+        all_techs = cur.fetchall()
+        for t in all_techs:
+            logging.warning(
+                "[DEBUG TECHS] id=%s name=%s status=%s user_id=%s is_admin=%s "
+                "has_coords=%s skills=%s",
+                t["id"], t["name"], t["status"], t["user_id"], t["is_admin"],
+                bool(t["home_latitude"] and t["home_longitude"]),
+                t["skills"],
+            )
+        logging.warning(
+            "[DEBUG TECHS] Looking for service_type='%s' on date=%s, "
+            "filter= skills @> '[\"%s\"]'::jsonb",
+            service_type, date, service_type,
+        )
+
         cur.execute("""
             SELECT
                 t.id, t.name, t.email, t.phone, t.skills,
@@ -813,13 +1012,13 @@ def get_techs_with_appointments_for_day(service_type, date):
                     '[]'
                 ) AS appointments
             FROM technicians t
-            INNER JOIN users u ON u.id = t.user_id
+            LEFT JOIN users u ON u.id = t.user_id
             LEFT JOIN appointments a
                 ON a.technician_id = t.id
                AND DATE(a.start_time) = %s
                AND a.status IN ('scheduled', 'blocked')
             WHERE t.status = 'active'
-              AND u.is_admin = FALSE
+              AND (u.is_admin IS NULL OR u.is_admin = FALSE)
               AND t.skills @> %s::jsonb
             GROUP BY
                 t.id, t.name, t.email, t.phone, t.skills,
@@ -829,6 +1028,7 @@ def get_techs_with_appointments_for_day(service_type, date):
                 t.calendar_credentials, t.calendar_email
         """, (date, f'["{service_type}"]'))
         rows = cur.fetchall()
+        logging.warning("[DEBUG TECHS] Filtered query returned %d techs", len(rows))
         result = []
         for row in rows:
             tech = dict(row)
