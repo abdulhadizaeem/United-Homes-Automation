@@ -372,7 +372,11 @@ def _sync_admin_calendar_changes():
     updated_creds = cal.get_updated_credentials()
     from src.utils.db import save_admin_calendar_credentials
     try:
-        save_admin_calendar_credentials(updated_creds)
+        save_admin_calendar_credentials(
+            admin_creds.get("provider", "google"),
+            admin_creds.get("email", ""),
+            updated_creds,
+        )
     except Exception:
         pass
 
@@ -564,7 +568,11 @@ def run_full_calendar_sync():
     updated_creds = cal.get_updated_credentials()
     from src.utils.db import save_admin_calendar_credentials
     try:
-        save_admin_calendar_credentials(updated_creds)
+        save_admin_calendar_credentials(
+            admin_creds.get("provider", "google"),
+            admin_creds.get("email", ""),
+            updated_creds,
+        )
     except Exception:
         pass
 

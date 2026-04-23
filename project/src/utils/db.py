@@ -568,21 +568,24 @@ def get_admin_calendar_credentials():
         conn.close()
 
 
-def save_admin_calendar_credentials(credentials_dict):
-    """Update the admin tech's calendar credentials (after token refresh)."""
+def save_admin_calendar_credentials(provider, email, credentials_dict):
+    """Save or update the admin tech's calendar credentials."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
             UPDATE technicians
-            SET calendar_credentials = %s::jsonb
+            SET calendar_provider = %s,
+                calendar_email = %s,
+                calendar_credentials = %s::jsonb,
+                calendar_connected = TRUE
             WHERE id = (
                 SELECT t.id FROM technicians t
                 INNER JOIN users u ON u.id = t.user_id
                 WHERE u.is_admin = TRUE
                 LIMIT 1
             )
-        """, (json.dumps(credentials_dict),))
+        """, (provider, email, json.dumps(credentials_dict)))
         conn.commit()
     finally:
         cur.close()
