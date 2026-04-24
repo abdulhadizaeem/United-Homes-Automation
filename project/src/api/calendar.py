@@ -533,26 +533,68 @@ async def full_calendar_sync(current_user: dict = Depends(get_current_user)):
     return JSONResponse(status_code=200, content={"success": True, **result})
 
 
-def run_full_calendar_sync():
-    """Core sync logic -- callable from endpoint or scheduler."""
-    from src.utils.db import get_admin_calendar_credentials
-    from datetime import datetime, timedelta, timezone
+def _match_calendar_to_tech(cal_name, techs):
+    """Fuzzy-match a Google sub-calendar name to a technician.
 
-    admin_creds = get_admin_calendar_credentials()
-    if not admin_creds or not admin_creds.get("connected"):
-        return {"synced": 0, "skipped": 0, "message": "Admin calendar not connected"}
+    Matching rules (case-insensitive):
+    1. Exact full name match
+    2. Calendar name is contained in tech name or vice versa
+    3. First word of calendar name matches first word of tech name
 
-    if admin_creds.get("provider") != "google":
-        return {"synced": 0, "skipped": 0, "message": "Only Google supported"}
+    Returns the matched tech dict or None.
+    """
+    if not cal_name or not techs:
+        return None
 
-    cal = GoogleCalendarService(admin_creds["credentials"])
+    cal_lower = cal_name.strip().lower()
+    cal_first = cal_lower.split()[0] if cal_lower else ""
 
-    now = datetime.now(timezone.utc)
-    future = now + timedelta(days=90)
+    # Pass 1: exact match
+    for tech in techs:
+        tech_name = (tech.get("name") or "").strip().lower()
+        if tech_name and tech_name == cal_lower:
+            return tech
+
+    # Pass 2: one contains the other
+    for tech in techs:
+        tech_name = (tech.get("name") or "").strip().lower()
+        if tech_name and (cal_lower in tech_name or tech_name in cal_lower):
+            return tech
+
+    # Pass 3: first-word match (handles "Holland" calendar -> "Holland Darcy" tech)
+    for tech in techs:
+        tech_name = (tech.get("name") or "").strip().lower()
+        tech_first = tech_name.split()[0] if tech_name else ""
+        if cal_first and tech_first and cal_first == tech_first:
+            return tech
+
+    # Pass 4: first 3 chars match (handles typos like Chimeny)
+    for tech in techs:
+        tech_name = (tech.get("name") or "").strip().lower()
+        tech_first = tech_name.split()[0] if tech_name else ""
+        if len(cal_first) >= 3 and len(tech_first) >= 3 and cal_first[:3] == tech_first[:3]:
+            return tech
+
+    return None
+
+
+def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
+                              tech_id, now, future):
+    """Fetch events from one sub-calendar and sync them into the DB.
+
+    Returns (synced_count, skipped_count).
+    """
+    from src.utils.db import (
+        get_appointment_by_calendar_event_id,
+        update_appointment_status,
+        update_appointment_times,
+        insert_appointment,
+    )
+    from dateutil.parser import parse as dt_parse
 
     try:
-        events_result = cal.service.events().list(
-            calendarId="primary",
+        events_result = cal_service.events().list(
+            calendarId=calendar_id,
             timeMin=now.isoformat(),
             timeMax=future.isoformat(),
             singleEvents=True,
@@ -561,30 +603,13 @@ def run_full_calendar_sync():
             showDeleted=True,
         ).execute()
     except Exception as e:
-        logging.error("[CALENDAR FULL SYNC] Failed to list events: %s", e)
-        return {"synced": 0, "skipped": 0, "error": str(e)}
-
-    # Refresh token
-    updated_creds = cal.get_updated_credentials()
-    from src.utils.db import save_admin_calendar_credentials
-    try:
-        save_admin_calendar_credentials(
-            admin_creds.get("provider", "google"),
-            admin_creds.get("email", ""),
-            updated_creds,
+        logging.error(
+            "[CALENDAR SYNC] Failed to list events for '%s': %s",
+            calendar_name, e,
         )
-    except Exception:
-        pass
+        return 0, 0
 
     events = events_result.get("items", [])
-    logging.warning("[CALENDAR FULL SYNC] Found %d future events", len(events))
-
-    from src.utils.db import (
-        get_appointment_by_calendar_event_id,
-        update_appointment_status,
-        update_appointment_times,
-    )
-
     synced = 0
     skipped = 0
 
@@ -595,7 +620,6 @@ def run_full_calendar_sync():
         existing = get_appointment_by_calendar_event_id(google_event_id)
 
         if existing:
-            # Update status if changed
             changed = False
             if status == "cancelled" and existing["status"] != "cancelled":
                 update_appointment_status(existing["id"], "cancelled")
@@ -604,12 +628,10 @@ def run_full_calendar_sync():
                 update_appointment_status(existing["id"], "scheduled")
                 changed = True
 
-            # Update times if changed
             if status != "cancelled":
                 start_raw = event.get("start", {}).get("dateTime")
                 end_raw = event.get("end", {}).get("dateTime")
                 if start_raw and end_raw:
-                    from dateutil.parser import parse as dt_parse
                     new_start = dt_parse(start_raw)
                     new_end = dt_parse(end_raw)
                     if (str(existing["start_time"]) != str(new_start)
@@ -623,7 +645,7 @@ def run_full_calendar_sync():
                 skipped += 1
             continue
 
-        # New event not in DB -- import it
+        # New event -- skip cancelled
         if status == "cancelled":
             skipped += 1
             continue
@@ -634,20 +656,18 @@ def run_full_calendar_sync():
             skipped += 1
             continue
 
-        from dateutil.parser import parse as dt_parse
         start_dt = dt_parse(start_raw)
         end_dt = dt_parse(end_raw)
         duration = int((end_dt - start_dt).total_seconds() / 60)
 
         summary = event.get("summary", "")
-        description = event.get("description", "")
 
-        # Try to extract customer name from summary (format: "Service - Customer Name")
         customer_name = "Calendar Import"
         if " - " in summary:
             customer_name = summary.split(" - ", 1)[1].strip()
+        elif summary:
+            customer_name = summary
 
-        # Try to extract service type from summary
         service_type = "other"
         summary_lower = summary.lower()
         for svc in ["air_duct", "chimney", "dryer_vent", "gutter", "power_washing"]:
@@ -655,11 +675,10 @@ def run_full_calendar_sync():
                 service_type = svc
                 break
 
-        from src.utils.db import insert_appointment
         try:
             insert_appointment(
                 calendar_event_id=google_event_id,
-                technician_id=None,
+                technician_id=tech_id,
                 customer_name=customer_name,
                 customer_phone=None,
                 customer_email=None,
@@ -674,13 +693,118 @@ def run_full_calendar_sync():
             )
             synced += 1
             logging.warning(
-                "[CALENDAR FULL SYNC] Imported: %s at %s", summary, start_dt,
+                "[CALENDAR SYNC] Imported: '%s' -> tech_id=%s at %s",
+                summary, tech_id, start_dt,
             )
         except Exception as e:
-            logging.error("[CALENDAR FULL SYNC] Failed to import event: %s", e)
+            logging.error("[CALENDAR SYNC] Failed to import event: %s", e)
             skipped += 1
 
-    logging.warning(
-        "[CALENDAR FULL SYNC] Done: %d synced, %d skipped", synced, skipped,
+    return synced, skipped
+
+
+def run_full_calendar_sync():
+    """Sync all sub-calendars from the admin's Google account into the DB.
+
+    For each sub-calendar:
+    1. Fuzzy-match the calendar name to a technician
+    2. Fetch future events (next 90 days)
+    3. Import new events with the matched technician_id
+    4. Update existing events if times/status changed
+    5. Skip duplicates (matched by Google event ID)
+    """
+    from src.utils.db import (
+        get_admin_calendar_credentials,
+        get_all_technicians,
+        save_admin_calendar_credentials,
     )
-    return {"synced": synced, "skipped": skipped}
+    from datetime import datetime, timedelta, timezone
+
+    admin_creds = get_admin_calendar_credentials()
+    if not admin_creds or not admin_creds.get("connected"):
+        return {"synced": 0, "skipped": 0, "message": "Admin calendar not connected"}
+
+    if admin_creds.get("provider") != "google":
+        return {"synced": 0, "skipped": 0, "message": "Only Google supported"}
+
+    cal = GoogleCalendarService(admin_creds["credentials"])
+
+    # Refresh token early
+    updated_creds = cal.get_updated_credentials()
+    try:
+        save_admin_calendar_credentials(
+            admin_creds.get("provider", "google"),
+            admin_creds.get("email", ""),
+            updated_creds,
+        )
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(days=90)
+
+    # Get all sub-calendars from admin's Google account
+    try:
+        calendar_list = cal.service.calendarList().list().execute()
+        sub_calendars = calendar_list.get("items", [])
+    except Exception as e:
+        logging.error("[CALENDAR SYNC] Failed to list sub-calendars: %s", e)
+        return {"synced": 0, "skipped": 0, "error": str(e)}
+
+    logging.warning(
+        "[CALENDAR SYNC] Found %d sub-calendars: %s",
+        len(sub_calendars),
+        [c.get("summary", "?") for c in sub_calendars],
+    )
+
+    # Load all active technicians for name matching
+    techs = get_all_technicians()
+    logging.warning(
+        "[CALENDAR SYNC] Active techs: %s",
+        [(t["id"], t["name"]) for t in techs],
+    )
+
+    total_synced = 0
+    total_skipped = 0
+    matched_calendars = []
+
+    for sub_cal in sub_calendars:
+        cal_id = sub_cal.get("id", "")
+        cal_name = sub_cal.get("summary", "")
+        cal_primary = sub_cal.get("primary", False)
+
+        # Skip the primary calendar (that's the admin's own calendar)
+        if cal_primary:
+            logging.info("[CALENDAR SYNC] Skipping primary calendar: %s", cal_name)
+            continue
+
+        # Try to match this sub-calendar to a technician
+        matched_tech = _match_calendar_to_tech(cal_name, techs)
+        tech_id = matched_tech["id"] if matched_tech else None
+        tech_name = matched_tech["name"] if matched_tech else "UNMATCHED"
+
+        logging.warning(
+            "[CALENDAR SYNC] Sub-calendar '%s' -> tech: %s (id=%s)",
+            cal_name, tech_name, tech_id,
+        )
+        matched_calendars.append({
+            "calendar": cal_name,
+            "tech": tech_name,
+            "tech_id": tech_id,
+        })
+
+        synced, skipped = _sync_events_for_calendar(
+            cal.service, cal_id, cal_name, tech_id, now, future,
+        )
+        total_synced += synced
+        total_skipped += skipped
+
+    logging.warning(
+        "[CALENDAR SYNC] Done: %d synced, %d skipped, %d calendars processed",
+        total_synced, total_skipped, len(matched_calendars),
+    )
+    return {
+        "synced": total_synced,
+        "skipped": total_skipped,
+        "calendars": matched_calendars,
+    }
