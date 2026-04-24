@@ -656,7 +656,7 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
         except Exception as cal_err:
             logging.warning("[BOOKING] Calendar push failed (non-fatal): %s", cal_err)
 
-        # Push to admin calendar (non-fatal) — shows ALL tech appointments on one calendar
+        # Push to admin calendar's tech sub-calendar (non-fatal)
         try:
             from src.utils.db import get_admin_calendar_credentials, save_admin_calendar_credentials
             admin_creds = get_admin_calendar_credentials()
@@ -664,7 +664,7 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                 admin_provider = admin_creds.get("provider")
                 admin_creds_dict = admin_creds.get("credentials", {})
                 service_label = request.service_type.replace("_", " ").title()
-                admin_event_summary = f"[{tech['name']}] {service_label} - {request.customer_name}"
+                admin_event_summary = f"{service_label} - {request.customer_name}"
                 admin_event_description = (
                     f"Technician: {tech['name']}\n"
                     f"Customer: {request.customer_name}\n"
@@ -679,6 +679,35 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                 if admin_provider == "google":
                     from src.services.google_calendar import GoogleCalendarService
                     admin_cal = GoogleCalendarService(admin_creds_dict)
+
+                    # Find the tech's sub-calendar
+                    target_calendar_id = "primary"
+                    try:
+                        cal_list = admin_cal.service.calendarList().list().execute()
+                        sub_cals = cal_list.get("items", [])
+                        tech_name_lower = tech["name"].strip().lower()
+                        tech_first = tech_name_lower.split()[0] if tech_name_lower else ""
+
+                        for sc in sub_cals:
+                            if sc.get("primary"):
+                                continue
+                            sc_name = (sc.get("summary") or "").strip().lower()
+                            sc_first = sc_name.split()[0] if sc_name else ""
+                            if (sc_name == tech_name_lower
+                                    or tech_name_lower in sc_name
+                                    or sc_name in tech_name_lower
+                                    or (tech_first and sc_first and tech_first == sc_first)):
+                                target_calendar_id = sc["id"]
+                                logging.info(
+                                    "[BOOKING] Matched tech '%s' to sub-calendar '%s' (id=%s)",
+                                    tech["name"], sc.get("summary"), sc["id"],
+                                )
+                                break
+                    except Exception as list_err:
+                        logging.warning(
+                            "[BOOKING] Could not list sub-calendars, using primary: %s", list_err,
+                        )
+
                     admin_cal.create_event(
                         summary=admin_event_summary,
                         start_datetime=request.start_time,
@@ -687,13 +716,17 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                         location=request.address,
                         attendees=attendees,
                         color_id=tech.get("calendar_color_id"),
+                        calendar_id=target_calendar_id,
                     )
                     save_admin_calendar_credentials(
                         "google",
                         admin_creds.get("email", ""),
                         admin_cal.get_updated_credentials(),
                     )
-                    logging.info("[BOOKING] Admin Google Calendar event created")
+                    logging.info(
+                        "[BOOKING] Admin calendar event created on calendar=%s",
+                        target_calendar_id,
+                    )
                 elif admin_provider == "outlook":
                     from src.services.outlook_calendar import OutlookCalendarService
                     admin_cal = OutlookCalendarService(admin_creds_dict)

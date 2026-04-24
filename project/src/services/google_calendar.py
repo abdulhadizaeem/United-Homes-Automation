@@ -73,7 +73,7 @@ class GoogleCalendarService:
 
     def create_event(self, summary: str, start_datetime: datetime, end_datetime: datetime,
                      description: str = '', location: str = '', attendees: List[str] = None,
-                     color_id: str = None):
+                     color_id: str = None, calendar_id: str = "primary"):
         try:
             event = {
                 "summary": summary,
@@ -93,7 +93,7 @@ class GoogleCalendarService:
             if attendees:
                 event["attendees"] = [{"email": email} for email in attendees]
             created = self.service.events().insert(
-                calendarId="primary",
+                calendarId=calendar_id,
                 body=event,
                 sendUpdates="all" if attendees else "none"
             ).execute()
