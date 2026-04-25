@@ -988,10 +988,12 @@ def get_techs_with_appointments_for_day(service_type, date):
                 bool(t["home_latitude"] and t["home_longitude"]),
                 t["skills"],
             )
+        normalized_service = service_type.lower().replace("_", " ")
+        first_word = normalized_service.split()[0] if normalized_service else ""
         logging.warning(
             "[DEBUG TECHS] Looking for service_type='%s' on date=%s, "
-            "filter= skills @> '[\"%s\"]'::jsonb",
-            service_type, date, service_type,
+            "normalized='%s', first_word='%s'",
+            service_type, date, normalized_service, first_word,
         )
 
         cur.execute("""
@@ -1022,14 +1024,18 @@ def get_techs_with_appointments_for_day(service_type, date):
                AND a.status IN ('scheduled', 'blocked')
             WHERE t.status = 'active'
               AND (u.is_admin IS NULL OR u.is_admin = FALSE)
-              AND t.skills @> %s::jsonb
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements_text(t.skills) AS skill
+                  WHERE LOWER(REPLACE(skill, '_', ' ')) LIKE %s
+                     OR LOWER(REPLACE(skill, '_', ' ')) LIKE %s
+              )
             GROUP BY
                 t.id, t.name, t.email, t.phone, t.skills,
                 t.home_latitude, t.home_longitude, t.home_address,
                 t.max_radius_miles, t.status, t.calendar_color_id,
                 t.calendar_connected, t.calendar_provider,
                 t.calendar_credentials, t.calendar_email
-        """, (date, f'["{service_type}"]'))
+        """, (date, f'{first_word}%', f'%{normalized_service}%'))
         rows = cur.fetchall()
         logging.warning("[DEBUG TECHS] Filtered query returned %d techs", len(rows))
         result = []

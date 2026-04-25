@@ -533,13 +533,34 @@ async def full_calendar_sync(current_user: dict = Depends(get_current_user)):
     return JSONResponse(status_code=200, content={"success": True, **result})
 
 
+# Calendars to skip (not tech-related)
+_SKIP_CALENDAR_PATTERNS = {
+    "holidays", "birthdays", "contacts", "reminders",
+    "other", "tasks", "weather",
+}
+
+
+def _is_skip_calendar(cal_name):
+    """Return True if this calendar is clearly not a tech calendar."""
+    lower = cal_name.strip().lower()
+    # Skip email-style IDs (e.g. 'ali.talha9964@gmail.com')
+    if "@" in lower:
+        return True
+    # Skip known non-tech patterns
+    for pattern in _SKIP_CALENDAR_PATTERNS:
+        if pattern in lower:
+            return True
+    return False
+
+
 def _match_calendar_to_tech(cal_name, techs):
     """Fuzzy-match a Google sub-calendar name to a technician.
 
     Matching rules (case-insensitive):
     1. Exact full name match
-    2. Calendar name is contained in tech name or vice versa
+    2. Tech full name is contained in calendar name or vice versa
     3. First word of calendar name matches first word of tech name
+       (min 4 chars to avoid false positives)
 
     Returns the matched tech dict or None.
     """
@@ -555,25 +576,27 @@ def _match_calendar_to_tech(cal_name, techs):
         if tech_name and tech_name == cal_lower:
             return tech
 
-    # Pass 2: one contains the other
+    # Pass 2: tech name is contained in calendar name or vice versa
     for tech in techs:
         tech_name = (tech.get("name") or "").strip().lower()
-        if tech_name and (cal_lower in tech_name or tech_name in cal_lower):
+        if tech_name and (tech_name in cal_lower or cal_lower in tech_name):
             return tech
 
-    # Pass 3: first-word match (handles "Holland" calendar -> "Holland Darcy" tech)
-    for tech in techs:
-        tech_name = (tech.get("name") or "").strip().lower()
-        tech_first = tech_name.split()[0] if tech_name else ""
-        if cal_first and tech_first and cal_first == tech_first:
-            return tech
+    # Pass 3: first-word exact match (min 4 chars to avoid false positives)
+    if len(cal_first) >= 4:
+        for tech in techs:
+            tech_name = (tech.get("name") or "").strip().lower()
+            tech_first = tech_name.split()[0] if tech_name else ""
+            if tech_first and cal_first == tech_first:
+                return tech
 
-    # Pass 4: first 3 chars match (handles typos like Chimeny)
-    for tech in techs:
-        tech_name = (tech.get("name") or "").strip().lower()
-        tech_first = tech_name.split()[0] if tech_name else ""
-        if len(cal_first) >= 3 and len(tech_first) >= 3 and cal_first[:3] == tech_first[:3]:
-            return tech
+    # Pass 4: first 4 chars of first word match (handles michell vs michael)
+    if len(cal_first) >= 4:
+        for tech in techs:
+            tech_name = (tech.get("name") or "").strip().lower()
+            tech_first = tech_name.split()[0] if tech_name else ""
+            if len(tech_first) >= 4 and cal_first[:4] == tech_first[:4]:
+                return tech
 
     return None
 
@@ -590,7 +613,7 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
         update_appointment_times,
         insert_appointment,
     )
-    from dateutil.parser import parse as dt_parse
+    from datetime import datetime as _dt
 
     try:
         events_result = cal_service.events().list(
@@ -632,8 +655,8 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
                 start_raw = event.get("start", {}).get("dateTime")
                 end_raw = event.get("end", {}).get("dateTime")
                 if start_raw and end_raw:
-                    new_start = dt_parse(start_raw)
-                    new_end = dt_parse(end_raw)
+                    new_start = _dt.fromisoformat(start_raw)
+                    new_end = _dt.fromisoformat(end_raw)
                     if (str(existing["start_time"]) != str(new_start)
                             or str(existing["end_time"]) != str(new_end)):
                         update_appointment_times(existing["id"], new_start, new_end)
@@ -656,8 +679,8 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
             skipped += 1
             continue
 
-        start_dt = dt_parse(start_raw)
-        end_dt = dt_parse(end_raw)
+        start_dt = _dt.fromisoformat(start_raw)
+        end_dt = _dt.fromisoformat(end_raw)
         duration = int((end_dt - start_dt).total_seconds() / 60)
 
         summary = event.get("summary", "")
@@ -773,9 +796,12 @@ def run_full_calendar_sync():
         cal_name = sub_cal.get("summary", "")
         cal_primary = sub_cal.get("primary", False)
 
-        # Skip the primary calendar (that's the admin's own calendar)
+        # Skip the primary calendar and non-tech calendars
         if cal_primary:
             logging.info("[CALENDAR SYNC] Skipping primary calendar: %s", cal_name)
+            continue
+        if _is_skip_calendar(cal_name):
+            logging.info("[CALENDAR SYNC] Skipping non-tech calendar: %s", cal_name)
             continue
 
         # Try to match this sub-calendar to a technician
