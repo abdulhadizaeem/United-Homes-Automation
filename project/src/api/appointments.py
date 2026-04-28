@@ -348,7 +348,14 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 continue
 
             # Appointments already loaded from the combined query
-            appointments = sorted(tech["appointments"], key=lambda a: a["start_time"])
+            appointments = sorted(
+                tech["appointments"],
+                key=lambda a: (
+                    datetime.fromisoformat(a["start_time"])
+                    if isinstance(a["start_time"], str)
+                    else a["start_time"]
+                ),
+            )
 
             # Step 3: Find best available fixed time slot
             slot_duration = timedelta(minutes=service_duration)
@@ -366,12 +373,18 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 for h, m in OVERFLOW_SLOTS
             ]
 
+            def _ensure_dt(val):
+                """Coerce a value to datetime -- handles strings from json_agg."""
+                if isinstance(val, str):
+                    return datetime.fromisoformat(val)
+                return val
+
             def _slot_conflicts(candidate, appts):
                 """Return True if candidate overlaps any existing appointment."""
                 candidate_end = candidate + slot_duration
                 for a in appts:
-                    a_start = a["start_time"]
-                    a_end = a["end_time"]
+                    a_start = _ensure_dt(a["start_time"])
+                    a_end = _ensure_dt(a["end_time"])
                     if hasattr(a_start, 'tzinfo') and a_start.tzinfo is None:
                         a_start = a_start.replace(tzinfo=eastern)
                     if hasattr(a_end, 'tzinfo') and a_end.tzinfo is None:
@@ -382,14 +395,15 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
 
             def _departure_point(slot, appts):
                 """Return (lat, lon) of last completed job before slot, or home."""
-                prev = [
-                    a for a in appts
-                    if (a["end_time"].replace(tzinfo=eastern)
-                        if hasattr(a["end_time"], 'tzinfo') and a["end_time"].tzinfo is None
-                        else a["end_time"]) <= slot
-                ]
+                prev = []
+                for a in appts:
+                    a_end = _ensure_dt(a["end_time"])
+                    if hasattr(a_end, 'tzinfo') and a_end.tzinfo is None:
+                        a_end = a_end.replace(tzinfo=eastern)
+                    if a_end <= slot:
+                        prev.append(a)
                 if prev:
-                    last = max(prev, key=lambda a: a["end_time"])
+                    last = max(prev, key=lambda a: _ensure_dt(a["end_time"]))
                     return float(last["latitude"]), float(last["longitude"])
                 return float(tech["home_latitude"]), float(tech["home_longitude"])
 
@@ -459,15 +473,6 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 depart_from_lat, depart_from_lon,
                 request.confirmed_latitude, request.confirmed_longitude,
             )
-
-            max_radius = tech.get("max_radius_miles") or 50
-
-            if distance > max_radius:
-                logging.warning(
-                    "[AVAILABILITY] Tech %s (id=%d): %.1f mi from job site, max=%dmi -- TOO FAR",
-                    tech["name"], tech["id"], distance, max_radius,
-                )
-                continue
 
             logging.info(
                 "[AVAILABILITY] Tech %s (id=%d): slot=%s, %.1f mi from departure point",
