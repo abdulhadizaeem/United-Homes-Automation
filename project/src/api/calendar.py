@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import traceback
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -770,14 +771,48 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
         from src.utils.radar import geocode_address
         event_location = event.get("location") or ""
         lat, lng = None, None
-        # Try event location first, fall back to summary (often an address)
+
+        _SKIP_GEO = re.compile(
+            r"(off|closed|do not|schedule|cancel|follow.?up|redo|done|"
+            r"friday|monday|tuesday|wednesday|thursday|saturday|sunday|"
+            r"serhii|michell|dummy|tentative|unassigned)",
+            re.IGNORECASE,
+        )
+
+        def _looks_like_address(text):
+            """Return True if text looks like a street address."""
+            if not text or len(text) < 8:
+                return False
+            if _SKIP_GEO.search(text):
+                return False
+            # Must contain a digit (street number) and a letter
+            if not re.search(r"\d", text) or not re.search(r"[a-zA-Z]", text):
+                return False
+            # Skip pure phone numbers
+            digits = re.sub(r"\D", "", text)
+            if len(digits) >= 7 and len(digits) / len(text.strip()) > 0.5:
+                return False
+            return True
+
         for addr_candidate in [event_location, summary]:
-            if addr_candidate and len(addr_candidate) > 5:
+            if _looks_like_address(addr_candidate):
                 geo = geocode_address(addr_candidate)
                 if geo and geo.get("latitude") and geo.get("longitude"):
                     lat = geo["latitude"]
                     lng = geo["longitude"]
                     break
+
+        # Detect blocking events (OFF, CLOSED, DO NOT SCHEDULE, etc.)
+        _BLOCK_KEYWORDS = re.compile(
+            r"\b(off\b|closed|do not|no work|unavailable|is off|"
+            r"don.?t schedule|not available)",
+            re.IGNORECASE,
+        )
+        if _BLOCK_KEYWORDS.search(summary):
+            event_status = "blocked"
+            service_type = "blocked"
+        else:
+            event_status = "scheduled"
 
         try:
             insert_appointment(
@@ -793,7 +828,7 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
                 start_time=start_dt,
                 end_time=end_dt,
                 duration_minutes=duration,
-                status="scheduled",
+                status=event_status,
             )
             synced += 1
             logging.warning(
