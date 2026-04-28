@@ -611,9 +611,10 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
         get_appointment_by_calendar_event_id,
         update_appointment_status,
         update_appointment_times,
+        _update_appointment_field,
         insert_appointment,
     )
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timedelta
 
     try:
         events_result = cal_service.events().list(
@@ -651,6 +652,24 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
                 update_appointment_status(existing["id"], "scheduled")
                 changed = True
 
+            # Update tech_id if it changed (e.g. was None from old sync)
+            if tech_id is not None and existing.get("technician_id") != tech_id:
+                _update_appointment_field(
+                    existing["id"], "technician_id", tech_id,
+                )
+                changed = True
+
+            # Update customer_name if it was 'Calendar Import'
+            summary = event.get("summary", "")
+            if summary and existing.get("customer_name") == "Calendar Import":
+                display_name = summary
+                if " - " in summary:
+                    display_name = summary.split(" - ", 1)[1].strip()
+                _update_appointment_field(
+                    existing["id"], "customer_name", display_name,
+                )
+                changed = True
+
             if status != "cancelled":
                 start_raw = event.get("start", {}).get("dateTime")
                 end_raw = event.get("end", {}).get("dateTime")
@@ -675,8 +694,58 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
 
         start_raw = event.get("start", {}).get("dateTime")
         end_raw = event.get("end", {}).get("dateTime")
+
+        # Handle all-day events (OFF days, holidays, etc.)
+        # These use 'date' instead of 'dateTime'
         if not start_raw or not end_raw:
-            skipped += 1
+            start_date_str = event.get("start", {}).get("date")
+            end_date_str = event.get("end", {}).get("date")
+            if not start_date_str:
+                skipped += 1
+                continue
+            # Convert all-day event to a blocked range: 6am to 10pm ET
+            from zoneinfo import ZoneInfo
+            eastern = ZoneInfo("America/New_York")
+            from datetime import date as _date
+            start_date = _date.fromisoformat(start_date_str)
+            end_date = _date.fromisoformat(end_date_str) if end_date_str else start_date
+            # Google all-day events: end date is exclusive (next day)
+            # Create one blocked appointment per day
+            current = start_date
+            while current < end_date:
+                day_start = _dt(current.year, current.month, current.day, 6, 0, tzinfo=eastern)
+                day_end = _dt(current.year, current.month, current.day, 22, 0, tzinfo=eastern)
+                day_event_id = f"{google_event_id}_{current.isoformat()}"
+                # Check if already imported
+                day_existing = get_appointment_by_calendar_event_id(day_event_id)
+                if not day_existing:
+                    try:
+                        insert_appointment(
+                            calendar_event_id=day_event_id,
+                            technician_id=tech_id,
+                            customer_name=summary or "Day Off",
+                            customer_phone=None,
+                            customer_email=None,
+                            service_type="blocked",
+                            address=None,
+                            latitude=None,
+                            longitude=None,
+                            start_time=day_start,
+                            end_time=day_end,
+                            duration_minutes=960,
+                            status="blocked",
+                        )
+                        synced += 1
+                        logging.warning(
+                            "[CALENDAR SYNC] Imported all-day: '%s' -> tech_id=%s on %s",
+                            summary, tech_id, current,
+                        )
+                    except Exception as e:
+                        logging.error("[CALENDAR SYNC] Failed to import all-day event: %s", e)
+                        skipped += 1
+                else:
+                    skipped += 1
+                current += timedelta(days=1)
             continue
 
         start_dt = _dt.fromisoformat(start_raw)
@@ -764,7 +833,13 @@ def run_full_calendar_sync():
         pass
 
     now = datetime.now(timezone.utc)
-    future = now + timedelta(days=90)
+    # Start from beginning of today (ET) so we capture today's events
+    from zoneinfo import ZoneInfo
+    eastern = ZoneInfo("America/New_York")
+    today_start = datetime.now(eastern).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    ).astimezone(timezone.utc)
+    future = now + timedelta(days=7)
 
     # Get all sub-calendars from admin's Google account
     try:
@@ -820,7 +895,7 @@ def run_full_calendar_sync():
         })
 
         synced, skipped = _sync_events_for_calendar(
-            cal.service, cal_id, cal_name, tech_id, now, future,
+            cal.service, cal_id, cal_name, tech_id, today_start, future,
         )
         total_synced += synced
         total_skipped += skipped
