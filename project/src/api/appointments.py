@@ -364,6 +364,7 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             depart_from_lon = float(tech["home_longitude"])
 
             # Build fixed slot datetimes for this day
+            now_et = datetime.now(eastern)
             main_slots = [
                 datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
                 for h, m in FIXED_SLOTS
@@ -372,6 +373,16 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
                 for h, m in OVERFLOW_SLOTS
             ]
+            # Skip slots that are already in the past
+            main_slots = [s for s in main_slots if s > now_et]
+            overflow_slots = [s for s in overflow_slots if s > now_et]
+
+            if not main_slots:
+                logging.info(
+                    "[AVAILABILITY] Tech %s: all slots in the past for %s",
+                    tech["name"], req_date,
+                )
+                continue
 
             def _ensure_dt(val):
                 """Coerce a value to datetime -- handles strings from json_agg."""
@@ -404,7 +415,10 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                         prev.append(a)
                 if prev:
                     last = max(prev, key=lambda a: _ensure_dt(a["end_time"]))
-                    return float(last["latitude"]), float(last["longitude"])
+                    lat = last.get("latitude")
+                    lon = last.get("longitude")
+                    if lat is not None and lon is not None:
+                        return float(lat), float(lon)
                 return float(tech["home_latitude"]), float(tech["home_longitude"])
 
             # Sort by customer preference: nearest fixed slot to preferred time

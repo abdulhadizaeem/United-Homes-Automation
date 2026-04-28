@@ -766,6 +766,18 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
             if svc.replace("_", " ") in summary_lower or svc in summary_lower:
                 service_type = svc
                 break
+        # Geocode the event location or summary to get lat/lng
+        from src.utils.radar import geocode_address
+        event_location = event.get("location") or ""
+        lat, lng = None, None
+        # Try event location first, fall back to summary (often an address)
+        for addr_candidate in [event_location, summary]:
+            if addr_candidate and len(addr_candidate) > 5:
+                geo = geocode_address(addr_candidate)
+                if geo and geo.get("latitude") and geo.get("longitude"):
+                    lat = geo["latitude"]
+                    lng = geo["longitude"]
+                    break
 
         try:
             insert_appointment(
@@ -775,9 +787,9 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
                 customer_phone=None,
                 customer_email=None,
                 service_type=service_type,
-                address=event.get("location"),
-                latitude=None,
-                longitude=None,
+                address=event_location or summary,
+                latitude=lat,
+                longitude=lng,
                 start_time=start_dt,
                 end_time=end_dt,
                 duration_minutes=duration,
@@ -785,8 +797,9 @@ def _sync_events_for_calendar(cal_service, calendar_id, calendar_name,
             )
             synced += 1
             logging.warning(
-                "[CALENDAR SYNC] Imported: '%s' -> tech_id=%s at %s",
+                "[CALENDAR SYNC] Imported: '%s' -> tech_id=%s at %s (geo=%s)",
                 summary, tech_id, start_dt,
+                f"{lat},{lng}" if lat else "none",
             )
         except Exception as e:
             logging.error("[CALENDAR SYNC] Failed to import event: %s", e)
