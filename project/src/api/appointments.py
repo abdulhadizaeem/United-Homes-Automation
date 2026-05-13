@@ -6,7 +6,7 @@ from datetime import date as date_type
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.utils.radar import geocode_address
 from src.utils.db import (
@@ -357,6 +357,27 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 ),
             )
 
+            # Whole-day block: if ANY appointment has OFF/CLOSED keywords
+            # or status='blocked', skip this tech entirely for the day
+            import re
+            _DAY_OFF_RE = re.compile(
+                r"\b(off\b|closed|do not|no work|unavailable|is off|"
+                r"don.?t schedule|not available)",
+                re.IGNORECASE,
+            )
+            day_blocked = False
+            for a in appointments:
+                name = a.get("customer_name") or ""
+                if a.get("status") == "blocked" or _DAY_OFF_RE.search(name):
+                    day_blocked = True
+                    logging.warning(
+                        "[AVAILABILITY] Tech %s BLOCKED for %s (reason: '%s')",
+                        tech["name"], req_date, name,
+                    )
+                    break
+            if day_blocked:
+                continue
+
             # Step 3: Find best available fixed time slot
             slot_duration = timedelta(minutes=service_duration)
             found_slot = None
@@ -396,10 +417,11 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 for a in appts:
                     a_start = _ensure_dt(a["start_time"])
                     a_end = _ensure_dt(a["end_time"])
-                    if hasattr(a_start, 'tzinfo') and a_start.tzinfo is None:
-                        a_start = a_start.replace(tzinfo=eastern)
-                    if hasattr(a_end, 'tzinfo') and a_end.tzinfo is None:
-                        a_end = a_end.replace(tzinfo=eastern)
+                    # DB stores UTC; naive datetimes from json_agg are UTC
+                    if a_start.tzinfo is None:
+                        a_start = a_start.replace(tzinfo=timezone.utc)
+                    if a_end.tzinfo is None:
+                        a_end = a_end.replace(tzinfo=timezone.utc)
                     if max(candidate, a_start) < min(candidate_end, a_end):
                         return True
                 return False
@@ -409,8 +431,8 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 prev = []
                 for a in appts:
                     a_end = _ensure_dt(a["end_time"])
-                    if hasattr(a_end, 'tzinfo') and a_end.tzinfo is None:
-                        a_end = a_end.replace(tzinfo=eastern)
+                    if a_end.tzinfo is None:
+                        a_end = a_end.replace(tzinfo=timezone.utc)
                     if a_end <= slot:
                         prev.append(a)
                 if prev:

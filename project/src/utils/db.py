@@ -1031,7 +1031,9 @@ def get_techs_with_appointments_for_day(service_type, date):
                             'end_time', a.end_time,
                             'latitude', a.latitude,
                             'longitude', a.longitude,
-                            'status', a.status
+                            'status', a.status,
+                            'customer_name', a.customer_name,
+                            'service_type', a.service_type
                         )
                     ) FILTER (WHERE a.id IS NOT NULL),
                     '[]'
