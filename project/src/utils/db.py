@@ -690,6 +690,23 @@ def update_appointment_times(appointment_id, start_time, end_time):
         conn.close()
 
 
+def update_appointment_calendar_event_id(old_event_id, new_event_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE appointments
+            SET calendar_event_id = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE calendar_event_id = %s
+        """, (new_event_id, old_event_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        cur.close()
+        conn.close()
+
+
+
 def _update_appointment_field(appointment_id, field, value):
     """Update a single field on an appointment row."""
     allowed = {"technician_id", "customer_name", "service_type", "status"}

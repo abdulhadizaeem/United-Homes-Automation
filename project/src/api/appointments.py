@@ -15,6 +15,7 @@ from src.utils.db import (
     get_calendar_credentials,
     insert_appointment,
     delete_route_cache,
+    update_appointment_calendar_event_id,
 )
 from src.utils.distance import calculate_distance, estimate_tech_location
 from src.utils.api_key_auth import verify_retell_api_key
@@ -188,7 +189,28 @@ class FindTechnicianResponse(BaseModel):
     technician: TechnicianInfo = None
     available: bool
     time_slot: str = None
+    alternative_slots: list = []
     message: str = None
+
+
+def format_time_for_ai(dt: datetime) -> str:
+    """Formats a datetime into a natural language string for the AI to read."""
+    eastern = ZoneInfo("America/New_York")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=eastern)
+    else:
+        dt = dt.astimezone(eastern)
+        
+    now = datetime.now(eastern)
+    if dt.date() == now.date():
+        day_str = "today"
+    elif dt.date() == (now + timedelta(days=1)).date():
+        day_str = "tomorrow"
+    else:
+        day_str = dt.strftime("on %A, %B %d")
+    
+    time_str = dt.strftime("%I:%M %p").lstrip("0")
+    return f"{day_str} at {time_str}"
 
 
 class BookAppointmentRequest(BaseModel):
@@ -278,52 +300,29 @@ OVERFLOW_SLOTS = [(11, 0), (13, 0)]
 
 @router.post("/find-technician-availability", response_model=FindTechnicianResponse)
 def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(verify_retell_api_key)):
-    """Find the best available technician for a given date.
-
-    Algorithm:
-    1. Get all techs with the matching skill
-    2. For each tech, find the earliest available slot on the requested date
-    3. Calculate distance from the tech's last job site (or home if first job)
-    4. Return the closest available tech with the assigned time slot
-    """
+    """Find the best technician and provide human-friendly time slots."""
     try:
         # Parse the requested date
         try:
             req_date = date_type.fromisoformat(request.requested_date)
         except ValueError:
             return FindTechnicianResponse(
-                success=False,
-                available=False,
-                message="Invalid date format. Please use YYYY-MM-DD.",
+                success=False, available=False,
+                message="Invalid date format. Please use YYYY-MM-DD."
             )
 
         eastern = ZoneInfo("America/New_York")
         service_duration = SERVICE_DURATIONS.get(request.service_type, 60)
+        now_et = datetime.now(eastern)
 
-        logging.info(
-            "[AVAILABILITY] Request: service=%s, date=%s, lat=%s, lng=%s",
-            request.service_type, req_date, request.confirmed_latitude,
-            request.confirmed_longitude,
-        )
-
-        # Single query: techs with the right skill + their appointments for the day
         techs = get_techs_with_appointments_for_day(request.service_type, req_date)
-        logging.info(
-            "[AVAILABILITY] Found %d techs for '%s': %s",
-            len(techs), request.service_type,
-            [(t["id"], t["name"]) for t in techs],
-        )
-
         if not techs:
             return FindTechnicianResponse(
-                success=False,
-                available=False,
-                message="No technicians available for this service type.",
+                success=False, available=False,
+                message="I'm sorry, I couldn't find any technicians available for that service type."
             )
 
         candidates = []
-
-        # Load job scope rules once and determine if this is a heavy job
         from src.utils.db import get_job_scope_rules
         _scope_rules = get_job_scope_rules()
         is_heavy = bool(
@@ -331,216 +330,83 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             and request.service_type in _scope_rules
             and request.job_units >= _scope_rules[request.service_type]["units_threshold"]
         )
-        if is_heavy:
-            logging.info(
-                "[AVAILABILITY] Heavy job: %s with %d units (threshold=%d)",
-                request.service_type, request.job_units,
-                _scope_rules[request.service_type]["units_threshold"],
-            )
+
+        def _ensure_dt(val):
+            if isinstance(val, str): return datetime.fromisoformat(val)
+            return val
+
+        def _slot_conflicts(candidate, appts):
+            candidate_end = candidate + timedelta(minutes=service_duration)
+            for a in appts:
+                a_start = _ensure_dt(a["start_time"])
+                a_end = _ensure_dt(a["end_time"])
+                if a_start.tzinfo is None: a_start = a_start.replace(tzinfo=timezone.utc)
+                if a_end.tzinfo is None: a_end = a_end.replace(tzinfo=timezone.utc)
+                a_start = a_start.astimezone(eastern)
+                a_end = a_end.astimezone(eastern)
+                
+                if max(candidate, a_start) < min(candidate_end, a_end):
+                    return True
+            return False
+
+        def _departure_point(slot, appts, tech):
+            prev = []
+            for a in appts:
+                ae = _ensure_dt(a["end_time"])
+                if ae.tzinfo is None: ae = ae.replace(tzinfo=timezone.utc)
+                if ae.astimezone(eastern) <= slot:
+                    prev.append(a)
+            if prev:
+                last = max(prev, key=lambda a: _ensure_dt(a["end_time"]))
+                lat, lon = last.get("latitude"), last.get("longitude")
+                if lat and lon: return float(lat), float(lon)
+            return float(tech["home_latitude"]), float(tech["home_longitude"])
 
         for tech in techs:
-            # Skip techs without home coordinates
-            if not tech.get("home_latitude") or not tech.get("home_longitude"):
-                logging.warning(
-                    "Tech %s (id=%d) has no home coordinates, skipping",
-                    tech["name"], tech["id"],
-                )
-                continue
+            if not tech.get("home_latitude") or not tech.get("home_longitude"): continue
 
-            # Appointments already loaded from the combined query
-            appointments = sorted(
-                tech["appointments"],
-                key=lambda a: (
-                    datetime.fromisoformat(a["start_time"])
-                    if isinstance(a["start_time"], str)
-                    else a["start_time"]
-                ),
-            )
-
-            # Whole-day block: if ANY appointment has OFF/CLOSED keywords
-            # or status='blocked', skip this tech entirely for the day
+            appointments = sorted(tech["appointments"], key=lambda a: _ensure_dt(a["start_time"]))
+            
             import re
-            _DAY_OFF_RE = re.compile(
-                r"\b(off\b|closed|do not|no work|unavailable|is off|"
-                r"don.?t schedule|not available)",
-                re.IGNORECASE,
-            )
-            day_blocked = False
-            for a in appointments:
-                name = a.get("customer_name") or ""
-                if a.get("status") == "blocked" or _DAY_OFF_RE.search(name):
-                    day_blocked = True
-                    logging.warning(
-                        "[AVAILABILITY] Tech %s BLOCKED for %s (reason: '%s')",
-                        tech["name"], req_date, name,
-                    )
-                    break
-            if day_blocked:
+            _DAY_OFF_RE = re.compile(r"\b(off|closed|no work|unavailable|is off|not available|holiday|vacation|personal)\b", re.IGNORECASE)
+            if any(a.get("status") == "blocked" or _DAY_OFF_RE.search(a.get("customer_name") or "") for a in appointments):
                 continue
 
-            # Step 3: Find best available fixed time slot
-            slot_duration = timedelta(minutes=service_duration)
-            found_slot = None
-            depart_from_lat = float(tech["home_latitude"])
-            depart_from_lon = float(tech["home_longitude"])
+            for h, m in FIXED_SLOTS + OVERFLOW_SLOTS:
+                slot = datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
+                if slot <= now_et: continue
 
-            # Build fixed slot datetimes for this day
-            now_et = datetime.now(eastern)
-            main_slots = [
-                datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
-                for h, m in FIXED_SLOTS
-            ]
-            overflow_slots = [
-                datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
-                for h, m in OVERFLOW_SLOTS
-            ]
-            # Skip slots that are already in the past
-            main_slots = [s for s in main_slots if s > now_et]
-            overflow_slots = [s for s in overflow_slots if s > now_et]
+                if not _slot_conflicts(slot, appointments):
+                    if is_heavy:
+                        next_slot = slot + timedelta(hours=3)
+                        if _slot_conflicts(next_slot, appointments): continue
 
-            if not main_slots:
-                logging.info(
-                    "[AVAILABILITY] Tech %s: all slots in the past for %s",
-                    tech["name"], req_date,
-                )
-                continue
-
-            def _ensure_dt(val):
-                """Coerce a value to datetime -- handles strings from json_agg."""
-                if isinstance(val, str):
-                    return datetime.fromisoformat(val)
-                return val
-
-            def _slot_conflicts(candidate, appts):
-                """Return True if candidate overlaps any existing appointment."""
-                candidate_end = candidate + slot_duration
-                for a in appts:
-                    a_start = _ensure_dt(a["start_time"])
-                    a_end = _ensure_dt(a["end_time"])
-                    # DB stores UTC; naive datetimes from json_agg are UTC
-                    if a_start.tzinfo is None:
-                        a_start = a_start.replace(tzinfo=timezone.utc)
-                    if a_end.tzinfo is None:
-                        a_end = a_end.replace(tzinfo=timezone.utc)
-                    if max(candidate, a_start) < min(candidate_end, a_end):
-                        return True
-                return False
-
-            def _departure_point(slot, appts):
-                """Return (lat, lon) of last completed job before slot, or home."""
-                prev = []
-                for a in appts:
-                    a_end = _ensure_dt(a["end_time"])
-                    if a_end.tzinfo is None:
-                        a_end = a_end.replace(tzinfo=timezone.utc)
-                    if a_end <= slot:
-                        prev.append(a)
-                if prev:
-                    last = max(prev, key=lambda a: _ensure_dt(a["end_time"]))
-                    lat = last.get("latitude")
-                    lon = last.get("longitude")
-                    if lat is not None and lon is not None:
-                        return float(lat), float(lon)
-                return float(tech["home_latitude"]), float(tech["home_longitude"])
-
-            # Sort by customer preference: nearest fixed slot to preferred time
-            if request.preferred_time:
-                try:
-                    ph, pm = map(int, request.preferred_time.split(":"))
-                    pref_dt = datetime(req_date.year, req_date.month, req_date.day,
-                                       ph, pm, tzinfo=eastern)
-                    slot_order = sorted(main_slots,
-                                        key=lambda s: abs((s - pref_dt).total_seconds()))
-                except Exception:
-                    slot_order = main_slots
-            else:
-                slot_order = main_slots
-
-            blocked_slot = None
-
-            if is_heavy:
-                # Heavy job: find first pair of consecutive free main slots
-                for i in range(len(main_slots) - 1):
-                    s1, s2 = main_slots[i], main_slots[i + 1]
-                    if not _slot_conflicts(s1, appointments) and not _slot_conflicts(s2, appointments):
-                        found_slot = s1
-                        blocked_slot = s2
-                        depart_from_lat, depart_from_lon = _departure_point(s1, appointments)
-                        logging.info(
-                            "[AVAILABILITY] Tech %s: heavy job %s + %s blocked",
-                            tech["name"], s1.strftime("%I:%M %p"), s2.strftime("%I:%M %p"),
-                        )
-                        break
-            else:
-                # Standard: try main slots in preference order
-                for slot in slot_order:
-                    if not _slot_conflicts(slot, appointments):
-                        found_slot = slot
-                        depart_from_lat, depart_from_lon = _departure_point(slot, appointments)
-                        logging.info(
-                            "[AVAILABILITY] Tech %s: main slot %s free",
-                            tech["name"], found_slot.strftime("%I:%M %p"),
-                        )
-                        break
-
-                # Overflow: all 4 main slots taken -> try 11am then 1pm
-                if not found_slot:
-                    taken = sum(1 for s in main_slots if _slot_conflicts(s, appointments))
-                    if taken >= len(FIXED_SLOTS):
-                        for slot in overflow_slots:
-                            if not _slot_conflicts(slot, appointments):
-                                found_slot = slot
-                                depart_from_lat, depart_from_lon = _departure_point(slot, appointments)
-                                logging.info(
-                                    "[AVAILABILITY] Tech %s: overflow slot %s",
-                                    tech["name"], found_slot.strftime("%I:%M %p"),
-                                )
-                                break
-
-            if not found_slot:
-                logging.info(
-                    "[AVAILABILITY] Tech %s (id=%d) is FULL on %s",
-                    tech["name"], tech["id"], req_date,
-                )
-                continue
-
-            # Step 4: Calculate distance from departure point to customer
-            distance = calculate_distance(
-                depart_from_lat, depart_from_lon,
-                request.confirmed_latitude, request.confirmed_longitude,
-            )
-
-            logging.info(
-                "[AVAILABILITY] Tech %s (id=%d): slot=%s, %.1f mi from departure point",
-                tech["name"], tech["id"], found_slot.strftime("%I:%M %p"), distance,
-            )
-
-            candidates.append({
-                "tech": tech,
-                "slot": found_slot,
-                "distance": distance,
-                "blocked_slot": blocked_slot,
-            })
+                    d_lat, d_lon = _departure_point(slot, appointments, tech)
+                    dist = calculate_distance(d_lat, d_lon, request.confirmed_latitude, request.confirmed_longitude)
+                    
+                    candidates.append({
+                        "tech": tech,
+                        "slot": slot,
+                        "distance": dist
+                    })
 
         if not candidates:
-            # Log all distances for debugging
-            logging.warning("[AVAILABILITY] No techs available for %s on %s", request.service_type, req_date)
             return FindTechnicianResponse(
-                success=False,
-                available=False,
-                message="No technicians available on this date. All technicians are either fully booked or outside service range.",
+                success=False, available=False,
+                message="I'm sorry, all our technicians are fully booked for that day. Would you like to try another date?"
             )
 
-        # Step 5: Sort by earliest slot, then shortest distance
-        candidates.sort(key=lambda c: (c["slot"], c["distance"]))
+        candidates.sort(key=lambda c: (c["distance"], c["slot"]))
         best = candidates[0]
+        
+        tech_alts = [
+            format_time_for_ai(c["slot"]) 
+            for c in candidates 
+            if c["tech"]["id"] == best["tech"]["id"] and c["slot"] != best["slot"]
+        ]
 
-        logging.info(
-            "[AVAILABILITY] BEST: %s at %s (%.1f mi)",
-            best["tech"]["name"],
-            best["slot"].strftime("%I:%M %p"),
-            best["distance"],
-        )
+        time_str = format_time_for_ai(best["slot"])
+        alt_phrase = f" I also have {tech_alts[0]} available if that works better." if tech_alts else ""
 
         return FindTechnicianResponse(
             success=True,
@@ -551,7 +417,8 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             ),
             available=True,
             time_slot=best["slot"].isoformat(),
-            message=f"{best['tech']['name']} available at {best['slot'].strftime('%I:%M %p')}",
+            alternative_slots=tech_alts[:3],
+            message=f"Yes, {best['tech']['name']} is available {time_str}.{alt_phrase} Would you like me to book that for you?",
         )
 
     except Exception as e:
@@ -574,6 +441,70 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
             raise HTTPException(status_code=404, detail="Technician not found")
 
         end_time = request.start_time + timedelta(minutes=request.duration_minutes)
+
+        try:
+            is_available = True
+            creds = get_calendar_credentials(request.technician_id)
+            if creds and creds.get("calendar_connected"):
+                provider = creds.get("calendar_provider")
+                creds_dict = creds.get("calendar_credentials", {})
+                if provider == "google":
+                    from src.services.google_calendar import GoogleCalendarService
+                    cal = GoogleCalendarService(creds_dict)
+                    if not cal.check_availability(request.start_time, end_time):
+                        is_available = False
+                elif provider == "outlook":
+                    from src.services.outlook_calendar import OutlookCalendarService
+                    cal = OutlookCalendarService(creds_dict)
+                    if not cal.check_availability(request.start_time, end_time):
+                        is_available = False
+            else:
+                from src.utils.db import get_admin_calendar_credentials
+                admin_creds = get_admin_calendar_credentials()
+                if admin_creds and admin_creds.get("connected") and admin_creds.get("provider") == "google":
+                    from src.services.google_calendar import GoogleCalendarService
+                    admin_cal = GoogleCalendarService(admin_creds["credentials"])
+                    target_calendar_id = "primary"
+                    cal_list = admin_cal.service.calendarList().list().execute()
+                    sub_cals = cal_list.get("items", [])
+                    tech_name_lower = tech["name"].strip().lower()
+                    tech_first = tech_name_lower.split()[0] if tech_name_lower else ""
+                    for sc in sub_cals:
+                        if sc.get("primary"):
+                            continue
+                        sc_name = (sc.get("summary") or "").strip().lower()
+                        sc_first = sc_name.split()[0] if sc_name else ""
+                        if (sc_name == tech_name_lower
+                                or tech_name_lower in sc_name
+                                or sc_name in tech_name_lower
+                                or (tech_first and sc_first and tech_first == sc_first)):
+                            target_calendar_id = sc["id"]
+                            break
+                    if target_calendar_id != "primary":
+                        t_min = request.start_time.isoformat() + "Z" if not request.start_time.tzinfo else request.start_time.isoformat()
+                        t_max = end_time.isoformat() + "Z" if not end_time.tzinfo else end_time.isoformat()
+                        events_result = admin_cal.service.events().list(
+                            calendarId=target_calendar_id,
+                            timeMin=t_min,
+                            timeMax=t_max,
+                            singleEvents=True,
+                            maxResults=10
+                        ).execute()
+                        active_events = [
+                            evt for evt in events_result.get("items", [])
+                            if evt.get("status") != "cancelled"
+                        ]
+                        if active_events:
+                            is_available = False
+            if not is_available:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The technician is no longer available at this time slot due to a scheduling conflict."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.warning(f"[BOOKING] Calendar availability check failed: {e}")
 
         appointment_id = str(uuid.uuid4())
         logging.info(f"[BOOKING] Generated appointment_id={appointment_id}")
@@ -721,7 +652,6 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                     from src.services.google_calendar import GoogleCalendarService
                     admin_cal = GoogleCalendarService(admin_creds_dict)
 
-                    # Find the tech's sub-calendar
                     target_calendar_id = "primary"
                     try:
                         cal_list = admin_cal.service.calendarList().list().execute()
@@ -734,10 +664,17 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                                 continue
                             sc_name = (sc.get("summary") or "").strip().lower()
                             sc_first = sc_name.split()[0] if sc_name else ""
-                            if (sc_name == tech_name_lower
-                                    or tech_name_lower in sc_name
-                                    or sc_name in tech_name_lower
-                                    or (tech_first and sc_first and tech_first == sc_first)):
+                            matched = False
+                            if sc_name == tech_name_lower:
+                                matched = True
+                            elif tech_name_lower in sc_name or sc_name in tech_name_lower:
+                                matched = True
+                            elif len(tech_first) >= 4 and tech_first == sc_first:
+                                matched = True
+                            elif len(tech_first) >= 4 and len(sc_first) >= 4 and tech_first[:4] == sc_first[:4]:
+                                matched = True
+
+                            if matched:
                                 target_calendar_id = sc["id"]
                                 logging.info(
                                     "[BOOKING] Matched tech '%s' to sub-calendar '%s' (id=%s)",
@@ -749,16 +686,42 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                             "[BOOKING] Could not list sub-calendars, using primary: %s", list_err,
                         )
 
-                    admin_cal.create_event(
-                        summary=admin_event_summary,
-                        start_datetime=request.start_time,
-                        end_datetime=end_time,
-                        description=admin_event_description,
-                        location=request.address,
-                        attendees=attendees,
-                        color_id=tech.get("calendar_color_id"),
-                        calendar_id=target_calendar_id,
-                    )
+                    res = None
+                    try:
+                        res = admin_cal.create_event(
+                            summary=admin_event_summary,
+                            start_datetime=request.start_time,
+                            end_datetime=end_time,
+                            description=admin_event_description,
+                            location=request.address,
+                            attendees=attendees,
+                            color_id=tech.get("calendar_color_id"),
+                            calendar_id=target_calendar_id,
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            "[BOOKING] Failed to push to sub-calendar %s: %s",
+                            target_calendar_id, e,
+                        )
+
+                    if not res and target_calendar_id != "primary":
+                        logging.warning("[BOOKING] Falling back to primary calendar...")
+                        try:
+                            res = admin_cal.create_event(
+                                summary=admin_event_summary,
+                                start_datetime=request.start_time,
+                                end_datetime=end_time,
+                                description=admin_event_description,
+                                location=request.address,
+                                attendees=attendees,
+                                color_id=tech.get("calendar_color_id"),
+                                calendar_id="primary",
+                            )
+                            if res:
+                                target_calendar_id = "primary"
+                        except Exception as prim_err:
+                            logging.error("[BOOKING] Fallback to primary calendar also failed: %s", prim_err)
+
                     save_admin_calendar_credentials(
                         "google",
                         admin_creds.get("email", ""),
@@ -768,10 +731,16 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                         "[BOOKING] Admin calendar event created on calendar=%s",
                         target_calendar_id,
                     )
+                    if res and "id" in res:
+                        update_appointment_calendar_event_id(appointment_id, res["id"])
+                        logging.info(
+                            "[BOOKING] Updated database appointment Event ID from %s to Google Event ID %s",
+                            appointment_id, res["id"],
+                        )
                 elif admin_provider == "outlook":
                     from src.services.outlook_calendar import OutlookCalendarService
                     admin_cal = OutlookCalendarService(admin_creds_dict)
-                    admin_cal.create_event(
+                    res = admin_cal.create_event(
                         summary=admin_event_summary,
                         start_datetime=request.start_time,
                         end_datetime=end_time,
@@ -785,6 +754,12 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                         admin_cal.get_updated_credentials(),
                     )
                     logging.info("[BOOKING] Admin Outlook Calendar event created")
+                    if res and "id" in res:
+                        update_appointment_calendar_event_id(appointment_id, res["id"])
+                        logging.info(
+                            "[BOOKING] Updated database appointment Event ID from %s to Outlook Event ID %s",
+                            appointment_id, res["id"],
+                        )
         except Exception as admin_cal_err:
             logging.warning("[BOOKING] Admin calendar push failed (non-fatal): %s", admin_cal_err)
 

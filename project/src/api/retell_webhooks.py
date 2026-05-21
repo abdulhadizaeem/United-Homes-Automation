@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from src.utils.db import upsert_call_log
@@ -37,8 +37,17 @@ def _get_current_date_string():
     return now.strftime("%A, %B %d, %Y. Current time: %I:%M %p ET")
 
 
+def run_full_calendar_sync_bg():
+    try:
+        from src.api.calendar import run_full_calendar_sync
+        result = run_full_calendar_sync()
+        logging.info(f"[CALL SYNC] Calendar synced in background on call start: {result}")
+    except Exception as e:
+        logging.warning(f"[CALL SYNC] Background calendar sync failed: {e}")
+
+
 @router.post("/retell")
-async def retell_webhook(request: Request):
+async def retell_webhook(request: Request, background_tasks: BackgroundTasks):
     """Handle Retell webhook events.
 
     On call_started: returns dynamic variables including current_date.
@@ -71,26 +80,13 @@ async def retell_webhook(request: Request):
 
     logging.info("Retell webhook: %s for call %s", event, call.get("call_id"))
 
-    # On call_started, inject dynamic variables including today's date
     if event == "call_started":
         current_date = _get_current_date_string()
         logging.info(
             "Injecting current_date for call %s: %s",
             call.get("call_id"), current_date,
         )
-
-        # Sync admin calendar to DB so availability is fresh
-        import threading
-        def _bg_sync():
-            try:
-                from src.api.calendar import run_full_calendar_sync
-                result = run_full_calendar_sync()
-                logging.warning(
-                    "[CALL SYNC] Calendar synced on call start: %s", result,
-                )
-            except Exception as e:
-                logging.warning("[CALL SYNC] Calendar sync failed (non-fatal): %s", e)
-        threading.Thread(target=_bg_sync, daemon=True).start()
+        background_tasks.add_task(run_full_calendar_sync_bg)
 
         return JSONResponse(status_code=200, content={
             "retell_llm_dynamic_variables": {
@@ -98,7 +94,6 @@ async def retell_webhook(request: Request):
             }
         })
 
-    # For call_ended and call_analyzed, store the call log
     call_data = {
         "call_id": call.get("call_id"),
         "agent_id": call.get("agent_id"),
