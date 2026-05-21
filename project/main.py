@@ -148,4 +148,4 @@ app.include_router(
 @app.get("/")
 def health_check():
     """Basic health check endpoint."""
-    return {"status": "ok", "version": "1.0.1"}
+    return {"status": "ok"}
