@@ -85,7 +85,7 @@ def send_daily_schedules():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: create tables, start scheduler."""
-    create_tables()
+    # create_tables()
 
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -148,4 +148,4 @@ app.include_router(
 @app.get("/")
 def health_check():
     """Basic health check endpoint."""
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.0.1"}
