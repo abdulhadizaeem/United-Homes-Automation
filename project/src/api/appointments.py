@@ -1,9 +1,11 @@
 import logging
+import re
 import uuid
 from typing import Optional
 from zoneinfo import ZoneInfo
 from datetime import date as date_type
-
+from src.utils.distance import calculate_distance, estimate_tech_location
+from src.utils.api_key_auth import verify_retell_api_key
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -16,11 +18,49 @@ from src.utils.db import (
     insert_appointment,
     delete_route_cache,
     update_appointment_calendar_event_id,
+    get_job_scope_rules,
 )
-from src.utils.distance import calculate_distance, estimate_tech_location
-from src.utils.api_key_auth import verify_retell_api_key
+_DAY_OFF_RE = re.compile(
+    r"\b(off|closed|no work|unavailable|is off|not available|holiday|vacation|personal)\b",
+    re.IGNORECASE,
+)
 
 router = APIRouter()
+
+
+def _find_tech_sub_calendar(admin_cal_service, tech_name: str) -> str:
+    """Return the Google Calendar sub-calendar ID that belongs to *tech_name*.
+
+    Falls back to ``'primary'`` if no match is found.
+    """
+    try:
+        cal_list = admin_cal_service.calendarList().list().execute()
+    except Exception as e:
+        logging.warning("[CALENDAR] Could not list sub-calendars: %s", e)
+        return "primary"
+
+    tech_name_lower = tech_name.strip().lower()
+    tech_first = tech_name_lower.split()[0] if tech_name_lower else ""
+
+    for sc in cal_list.get("items", []):
+        if sc.get("primary"):
+            continue
+        sc_name = (sc.get("summary") or "").strip().lower()
+        sc_first = sc_name.split()[0] if sc_name else ""
+        if (
+            sc_name == tech_name_lower
+            or tech_name_lower in sc_name
+            or sc_name in tech_name_lower
+            or (len(tech_first) >= 4 and tech_first == sc_first)
+            or (len(tech_first) >= 4 and len(sc_first) >= 4 and tech_first[:4] == sc_first[:4])
+        ):
+            logging.info(
+                "[CALENDAR] Matched tech '%s' -> sub-calendar '%s' (id=%s)",
+                tech_name, sc.get("summary"), sc["id"],
+            )
+            return sc["id"]
+
+    return "primary"
 
 
 @router.post("/get-current-datetime")
@@ -323,7 +363,6 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             )
 
         candidates = []
-        from src.utils.db import get_job_scope_rules
         _scope_rules = get_job_scope_rules()
         is_heavy = bool(
             request.job_units
@@ -367,8 +406,6 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
 
             appointments = sorted(tech["appointments"], key=lambda a: _ensure_dt(a["start_time"]))
             
-            import re
-            _DAY_OFF_RE = re.compile(r"\b(off|closed|no work|unavailable|is off|not available|holiday|vacation|personal)\b", re.IGNORECASE)
             if any(a.get("status") == "blocked" or _DAY_OFF_RE.search(a.get("customer_name") or "") for a in appointments):
                 continue
 
@@ -397,7 +434,113 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             )
 
         candidates.sort(key=lambda c: (c["distance"], c["slot"]))
-        best = candidates[0]
+
+        # --- Real-time Google Calendar verification (BATCHED) ---
+        # Fetch all events for the requested day from each tech's sub-calendar
+        # in ONE API call per tech, then check conflicts in memory.
+        # This avoids 1 API call per slot (which caused timeouts).
+        _cal_events_cache: dict = {}  # tech_id -> list of (start_dt, end_dt)
+
+        def _prefetch_tech_cal_events(tech_id, tech_name, day_date):
+            """Fetch all events for `day_date` from the tech's sub-calendar.
+            Results cached by tech_id to avoid duplicate API calls.
+            """
+            if tech_id in _cal_events_cache:
+                return _cal_events_cache[tech_id]
+            try:
+                from src.utils.db import get_admin_calendar_credentials
+                admin_creds = get_admin_calendar_credentials()
+                if not admin_creds or not admin_creds.get("connected"):
+                    _cal_events_cache[tech_id] = []
+                    return []
+                if admin_creds.get("provider") != "google":
+                    _cal_events_cache[tech_id] = []
+                    return []
+                from src.services.google_calendar import GoogleCalendarService
+                from zoneinfo import ZoneInfo as _ZI
+                _eastern = _ZI("America/New_York")
+                from datetime import datetime as _dt
+                day_start = _dt(day_date.year, day_date.month, day_date.day,
+                                0, 0, 0, tzinfo=_eastern)
+                day_end   = _dt(day_date.year, day_date.month, day_date.day,
+                                23, 59, 59, tzinfo=_eastern)
+                admin_cal = GoogleCalendarService(admin_creds["credentials"])
+                cal_id = _find_tech_sub_calendar(admin_cal.service, tech_name)
+                events_result = admin_cal.service.events().list(
+                    calendarId=cal_id,
+                    timeMin=day_start.isoformat(),
+                    timeMax=day_end.isoformat(),
+                    singleEvents=True,
+                    maxResults=50,
+                ).execute()
+                intervals = []
+                for ev in events_result.get("items", []):
+                    if ev.get("status") == "cancelled":
+                        continue
+                    s = ev.get("start", {}).get("dateTime")
+                    e = ev.get("end",   {}).get("dateTime")
+                    if s and e:
+                        from dateutil.parser import parse as _parse
+                        intervals.append((_parse(s), _parse(e), ev.get("summary", "")))
+                logging.info(
+                    "[AVAILABILITY] Pre-fetched %d events for tech '%s' on %s",
+                    len(intervals), tech_name, day_date,
+                )
+                _cal_events_cache[tech_id] = intervals
+                return intervals
+            except Exception as gc_err:
+                logging.warning(
+                    "[AVAILABILITY] Calendar pre-fetch failed for '%s' (non-fatal): %s",
+                    tech_name, gc_err,
+                )
+                _cal_events_cache[tech_id] = []
+                return []
+
+        def _cal_slot_conflicts(tech_id, tech_name, slot, duration_mins, day_date):
+            """Return True if Google Calendar shows any event overlapping [slot, slot+duration)."""
+            slot_end = slot + timedelta(minutes=duration_mins)
+            # Ensure tz-aware for comparison
+            if slot.tzinfo is None:
+                slot = slot.replace(tzinfo=timezone.utc)
+            if slot_end.tzinfo is None:
+                slot_end = slot_end.replace(tzinfo=timezone.utc)
+            intervals = _prefetch_tech_cal_events(tech_id, tech_name, day_date)
+            for ev_start, ev_end, ev_summary in intervals:
+                if ev_start.tzinfo is None:
+                    ev_start = ev_start.replace(tzinfo=timezone.utc)
+                if ev_end.tzinfo is None:
+                    ev_end = ev_end.replace(tzinfo=timezone.utc)
+                # Overlap: slot starts before event ends AND slot ends after event starts
+                if slot < ev_end and slot_end > ev_start:
+                    logging.warning(
+                        "[AVAILABILITY] Calendar conflict: tech '%s' at %s blocked by '%s'",
+                        tech_name, slot.strftime("%I:%M %p"), ev_summary,
+                    )
+                    return True
+            return False
+
+        # Walk candidates in order, skip any with a live calendar conflict
+        best = None
+        req_day = request.requested_date if hasattr(request.requested_date, "year") else \
+                  datetime.strptime(str(request.requested_date), "%Y-%m-%d").date()
+        for candidate in candidates:
+            if _cal_slot_conflicts(
+                candidate["tech"]["id"],
+                candidate["tech"]["name"],
+                candidate["slot"],
+                service_duration,
+                req_day,
+            ):
+                continue
+            best = candidate
+            break
+
+        if best is None:
+            return FindTechnicianResponse(
+                success=False, available=False,
+                message="I'm sorry, all our technicians are fully booked for that day. Would you like to try another date?"
+            )
+
         
         tech_alts = [
             format_time_for_ai(c["slot"]) 
@@ -464,22 +607,7 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                 if admin_creds and admin_creds.get("connected") and admin_creds.get("provider") == "google":
                     from src.services.google_calendar import GoogleCalendarService
                     admin_cal = GoogleCalendarService(admin_creds["credentials"])
-                    target_calendar_id = "primary"
-                    cal_list = admin_cal.service.calendarList().list().execute()
-                    sub_cals = cal_list.get("items", [])
-                    tech_name_lower = tech["name"].strip().lower()
-                    tech_first = tech_name_lower.split()[0] if tech_name_lower else ""
-                    for sc in sub_cals:
-                        if sc.get("primary"):
-                            continue
-                        sc_name = (sc.get("summary") or "").strip().lower()
-                        sc_first = sc_name.split()[0] if sc_name else ""
-                        if (sc_name == tech_name_lower
-                                or tech_name_lower in sc_name
-                                or sc_name in tech_name_lower
-                                or (tech_first and sc_first and tech_first == sc_first)):
-                            target_calendar_id = sc["id"]
-                            break
+                    target_calendar_id = _find_tech_sub_calendar(admin_cal.service, tech["name"])
                     if target_calendar_id != "primary":
                         t_min = request.start_time.isoformat() + "Z" if not request.start_time.tzinfo else request.start_time.isoformat()
                         t_max = end_time.isoformat() + "Z" if not end_time.tzinfo else end_time.isoformat()
@@ -529,7 +657,6 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
 
         # Heavy job: block the next fixed slot for this technician
         if request.job_units:
-            from src.utils.db import get_job_scope_rules
             _rules = get_job_scope_rules()
             _is_heavy = (
                 request.service_type in _rules
@@ -627,8 +754,6 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                     logging.info("[BOOKING] Outlook Calendar event created for tech %d", request.technician_id)
         except Exception as cal_err:
             logging.warning("[BOOKING] Calendar push failed (non-fatal): %s", cal_err)
-
-        # Push to admin calendar's tech sub-calendar (non-fatal)
         try:
             from src.utils.db import get_admin_calendar_credentials, save_admin_calendar_credentials
             admin_creds = get_admin_calendar_credentials()
@@ -652,39 +777,7 @@ def book_appointment(request: BookAppointmentRequest, _auth=Depends(verify_retel
                     from src.services.google_calendar import GoogleCalendarService
                     admin_cal = GoogleCalendarService(admin_creds_dict)
 
-                    target_calendar_id = "primary"
-                    try:
-                        cal_list = admin_cal.service.calendarList().list().execute()
-                        sub_cals = cal_list.get("items", [])
-                        tech_name_lower = tech["name"].strip().lower()
-                        tech_first = tech_name_lower.split()[0] if tech_name_lower else ""
-
-                        for sc in sub_cals:
-                            if sc.get("primary"):
-                                continue
-                            sc_name = (sc.get("summary") or "").strip().lower()
-                            sc_first = sc_name.split()[0] if sc_name else ""
-                            matched = False
-                            if sc_name == tech_name_lower:
-                                matched = True
-                            elif tech_name_lower in sc_name or sc_name in tech_name_lower:
-                                matched = True
-                            elif len(tech_first) >= 4 and tech_first == sc_first:
-                                matched = True
-                            elif len(tech_first) >= 4 and len(sc_first) >= 4 and tech_first[:4] == sc_first[:4]:
-                                matched = True
-
-                            if matched:
-                                target_calendar_id = sc["id"]
-                                logging.info(
-                                    "[BOOKING] Matched tech '%s' to sub-calendar '%s' (id=%s)",
-                                    tech["name"], sc.get("summary"), sc["id"],
-                                )
-                                break
-                    except Exception as list_err:
-                        logging.warning(
-                            "[BOOKING] Could not list sub-calendars, using primary: %s", list_err,
-                        )
+                    target_calendar_id = _find_tech_sub_calendar(admin_cal.service, tech["name"])
 
                     res = None
                     try:

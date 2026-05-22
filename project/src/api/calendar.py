@@ -957,3 +957,19 @@ def run_full_calendar_sync():
         "skipped": total_skipped,
         "calendars": matched_calendars,
     }
+
+
+@router.get("/dev-seed-creds")
+async def dev_seed_creds(current_user: dict = Depends(get_current_user)):
+    """Admin-only: export raw calendar credentials so a local dev environment
+    can seed its local cache file (calendar_creds_cache.json) without a direct
+    DB connection.  Never expose this on a public-facing prod server without
+    proper network controls.
+    """
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    from src.utils.db import get_admin_calendar_credentials
+    creds = get_admin_calendar_credentials()
+    if not creds:
+        raise HTTPException(status_code=404, detail="No admin calendar credentials found")
+    return JSONResponse(status_code=200, content={"success": True, "data": creds})
