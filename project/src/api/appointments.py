@@ -341,8 +341,10 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             for a in appts:
                 a_start = _ensure_dt(a["start_time"])
                 a_end = _ensure_dt(a["end_time"])
-                if a_start.tzinfo is None: a_start = a_start.replace(tzinfo=timezone.utc)
-                if a_end.tzinfo is None: a_end = a_end.replace(tzinfo=timezone.utc)
+                # Appointments table uses TIMESTAMP (no tz). Treat naive values as ET wall time
+                # so slot conflict checks align with offered ET slots.
+                if a_start.tzinfo is None: a_start = a_start.replace(tzinfo=eastern)
+                if a_end.tzinfo is None: a_end = a_end.replace(tzinfo=eastern)
                 a_start = a_start.astimezone(eastern)
                 a_end = a_end.astimezone(eastern)
                 
@@ -354,7 +356,7 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             prev = []
             for a in appts:
                 ae = _ensure_dt(a["end_time"])
-                if ae.tzinfo is None: ae = ae.replace(tzinfo=timezone.utc)
+                if ae.tzinfo is None: ae = ae.replace(tzinfo=eastern)
                 if ae.astimezone(eastern) <= slot:
                     prev.append(a)
             if prev:
