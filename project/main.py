@@ -24,7 +24,6 @@ from src.utils.db import create_tables
 
 
 def send_daily_schedules():
-    """Send each technician their next-day schedule at 6 PM ET."""
     from src.utils.db import get_all_technicians, get_appointments_paginated
     from src.utils.mail_service import send_technician_daily_schedule
 
@@ -84,9 +83,6 @@ def send_daily_schedules():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: create tables, start scheduler."""
-    # create_tables()
-
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -108,7 +104,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="United Home Services API", lifespan=lifespan)
 
-# CORS: locked to actual frontend origins
 _frontend = os.getenv("FRONTEND_URL", "https://aidash.unitedhomecarolina.com")
 _allowed_origins = [
     "https://aidash.unitedhomecarolina.com",
