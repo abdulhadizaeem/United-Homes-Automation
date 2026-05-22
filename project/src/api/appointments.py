@@ -424,12 +424,20 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             for a in appts:
                 a_start = _ensure_dt(a["start_time"])
                 a_end = _ensure_dt(a["end_time"])
-                if a_start.tzinfo is None: a_start = a_start.replace(tzinfo=timezone.utc)
-                if a_end.tzinfo is None: a_end = a_end.replace(tzinfo=timezone.utc)
-                a_start = a_start.astimezone(eastern)
-                a_end = a_end.astimezone(eastern)
                 
+                if a_start.tzinfo is None:
+                    a_start = a_start.replace(tzinfo=eastern)
+                else:
+                    a_start = a_start.astimezone(eastern)
+                    
+                if a_end.tzinfo is None:
+                    a_end = a_end.replace(tzinfo=eastern)
+                else:
+                    a_end = a_end.astimezone(eastern)
+                
+                logging.info(f"[DB-CHECK] Comparing DB Appt {a_start} - {a_end} WITH Slot {candidate} - {candidate_end}")
                 if max(candidate, a_start) < min(candidate_end, a_end):
+                    logging.info(f"[DB-CHECK] CONFLICT FOUND! Slot {candidate} blocked by DB appt {a_start}")
                     return True
             return False
 
@@ -450,6 +458,7 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             if not tech.get("home_latitude") or not tech.get("home_longitude"): continue
 
             appointments = sorted(tech["appointments"], key=lambda a: _ensure_dt(a["start_time"]))
+            logging.info(f"[DB-CHECK] Tech {tech['name']} has {len(appointments)} appointments in DB for {req_date}: {appointments}")
             
             if any(a.get("status") == "blocked" or _DAY_OFF_RE.search(a.get("customer_name") or "") for a in appointments):
                 continue
@@ -480,16 +489,9 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
 
         candidates.sort(key=lambda c: (c["distance"], c["slot"]))
 
-        # --- Real-time Google Calendar verification (BATCHED) ---
-        # Fetch all events for the requested day from each tech's sub-calendar
-        # in ONE API call per tech, then check conflicts in memory.
-        # This avoids 1 API call per slot (which caused timeouts).
         _cal_events_cache: dict = {}  # tech_id -> list of (start_dt, end_dt)
 
         def _prefetch_tech_cal_events(tech_id, tech_name, day_date):
-            """Fetch all events for `day_date` from the tech's sub-calendar.
-            Results cached by tech_id to avoid duplicate API calls.
-            """
             if tech_id in _cal_events_cache:
                 return _cal_events_cache[tech_id]
             try:
@@ -563,8 +565,6 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                     )
                     return True
             return False
-
-        # Walk candidates in order, skip any with a live calendar conflict
         best = None
         req_day = request.requested_date if hasattr(request.requested_date, "year") else \
                   datetime.strptime(str(request.requested_date), "%Y-%m-%d").date()
@@ -596,6 +596,9 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
         time_str = format_time_for_ai(best["slot"])
         alt_phrase = f" I also have {tech_alts[0]} available if that works better." if tech_alts else ""
 
+        response_msg = f"Yes, {best['tech']['name']} is available {time_str}.{alt_phrase} Would you like me to book that for you?"
+        logging.info(f"[RETELL-OUTPUT] Sending to Retell: {response_msg}")
+
         return FindTechnicianResponse(
             success=True,
             technician=TechnicianInfo(
@@ -606,7 +609,7 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             available=True,
             time_slot=best["slot"].isoformat(),
             alternative_slots=tech_alts[:3],
-            message=f"Yes, {best['tech']['name']} is available {time_str}.{alt_phrase} Would you like me to book that for you?",
+            message=response_msg,
         )
 
     except Exception as e:
