@@ -63,6 +63,51 @@ def _find_tech_sub_calendar(admin_cal_service, tech_name: str) -> str:
     return "primary"
 
 
+def delete_appointment_calendar_event(appt: dict):
+    event_id = appt.get("calendar_event_id")
+    if not event_id:
+        logging.info("[CALENDAR] No calendar_event_id found on appointment %s; skipping deletion", appt.get("id"))
+        return
+
+    from src.utils.db import get_admin_calendar_credentials, get_technician
+    admin_creds = get_admin_calendar_credentials()
+    if not admin_creds or not admin_creds.get("connected"):
+        logging.warning("[CALENDAR] Admin calendar credentials not connected; cannot delete event")
+        return
+
+    provider = admin_creds.get("provider")
+    try:
+        if provider == "google":
+            from src.services.google_calendar import GoogleCalendarService
+            admin_cal = GoogleCalendarService(admin_creds["credentials"])
+            tech_name = "primary"
+            if appt.get("technician_id"):
+                tech = get_technician(appt["technician_id"])
+                if tech:
+                    tech_name = tech.get("name", "primary")
+            target_calendar_id = _find_tech_sub_calendar(admin_cal.service, tech_name)
+            logging.info(
+                "[CALENDAR] Deleting event ID %s from Google sub-calendar %s for tech '%s'",
+                event_id, target_calendar_id, tech_name
+            )
+            success = admin_cal.delete_event(event_id, calendar_id=target_calendar_id)
+            if success:
+                logging.info("[CALENDAR] Google Calendar event deleted successfully")
+            else:
+                logging.warning("[CALENDAR] Failed to delete Google Calendar event")
+        elif provider == "outlook":
+            from src.services.outlook_calendar import OutlookCalendarService
+            admin_cal = OutlookCalendarService(admin_creds["credentials"])
+            logging.info("[CALENDAR] Deleting event ID %s from Outlook Calendar", event_id)
+            success = admin_cal.delete_event(event_id)
+            if success:
+                logging.info("[CALENDAR] Outlook Calendar event deleted successfully")
+            else:
+                logging.warning("[CALENDAR] Failed to delete Outlook Calendar event")
+    except Exception as err:
+        logging.error("[CALENDAR] Exception during calendar event deletion: %s", err)
+
+
 @router.post("/get-current-datetime")
 def get_current_datetime(_auth=Depends(verify_retell_api_key)):
     """Return the current date and time in Eastern Time for the agent."""
@@ -890,7 +935,7 @@ def cancel_appointment_by_phone(request: CancelByPhoneRequest, _auth=Depends(ver
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
         cur.execute("""
-            SELECT id, customer_name, service_type, start_time, status
+            SELECT id, customer_name, service_type, start_time, status, calendar_event_id, technician_id
             FROM appointments
             WHERE customer_phone = %s AND status = 'scheduled'
             AND start_time > CURRENT_TIMESTAMP
@@ -900,7 +945,7 @@ def cancel_appointment_by_phone(request: CancelByPhoneRequest, _auth=Depends(ver
 
         if not appt:
             cur.execute("""
-                SELECT id, customer_name, service_type, start_time, status
+                SELECT id, customer_name, service_type, start_time, status, calendar_event_id, technician_id
                 FROM appointments_cache
                 WHERE customer_phone = %s AND status IN ('scheduled', 'confirmed')
                 AND start_time > CURRENT_TIMESTAMP
@@ -917,6 +962,11 @@ def cancel_appointment_by_phone(request: CancelByPhoneRequest, _auth=Depends(ver
         """, (appt["id"],))
         conn.commit()
 
+        try:
+            delete_appointment_calendar_event(dict(appt))
+        except Exception as cal_err:
+            logging.error(f"[CALENDAR] Non-fatal error deleting calendar event: {cal_err}")
+
         return {
             "success": True,
             "message": f"Appointment for {appt['customer_name']} on {appt['start_time']} has been cancelled",
@@ -932,6 +982,7 @@ def cancel_appointment_by_phone(request: CancelByPhoneRequest, _auth=Depends(ver
     finally:
         cur.close()
         conn.close()
+
 
 
 class BookRedoRequest(BaseModel):

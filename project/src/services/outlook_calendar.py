@@ -122,6 +122,22 @@ class OutlookCalendarService:
             }
         return None
 
+    def delete_event(self, event_id: str):
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        url = f"{self.GRAPH_API_ENDPOINT}/me/calendar/events/{event_id}"
+        try:
+            response = requests.request("DELETE", url, headers=headers)
+            if response.status_code in [200, 204]:
+                return True
+            logging.error(f"Outlook API delete error {response.status_code}: {response.text}")
+            return False
+        except Exception as e:
+            logging.error(f"Outlook delete request error: {e}")
+            return False
+
     def get_updated_credentials(self):
         self._refresh_if_needed()
         return {

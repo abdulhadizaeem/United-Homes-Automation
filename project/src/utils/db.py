@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Local-dev fallback: when the production DB is unreachable, calendar credentials
-# are read from / written to this file so the Google Calendar check still works.
 _CREDS_CACHE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "calendar_creds_cache.json",
@@ -17,7 +15,7 @@ _CREDS_CACHE_PATH = os.path.join(
 
 
 def get_db_connection():
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+    return psycopg2.connect(os.getenv("DATABASE_URL"), connect_timeout=3)
 
 
 def create_tables():
@@ -553,7 +551,6 @@ def get_calendar_credentials(tech_id):
 
 
 def _read_creds_cache():
-    """Read calendar credentials from the local cache file (dev fallback)."""
     try:
         if os.path.exists(_CREDS_CACHE_PATH):
             with open(_CREDS_CACHE_PATH, "r") as f:
@@ -566,7 +563,6 @@ def _read_creds_cache():
 
 
 def _write_creds_cache(provider, email, credentials_dict):
-    """Write calendar credentials to the local cache file."""
     try:
         data = {
             "provider": provider,
@@ -582,11 +578,6 @@ def _write_creds_cache(provider, email, credentials_dict):
 
 
 def get_admin_calendar_credentials():
-    """Get calendar credentials for the admin user's technician record.
-
-    Falls back to a local JSON cache file when the production DB is unreachable
-    (e.g. in a local dev environment behind a firewall).
-    """
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -605,7 +596,6 @@ def get_admin_calendar_credentials():
             result = cur.fetchone()
             if result:
                 row = dict(result)
-                # Opportunistically refresh the local cache from DB
                 _write_creds_cache(
                     row.get("provider"),
                     row.get("email"),
@@ -618,19 +608,13 @@ def get_admin_calendar_credentials():
             conn.close()
     except Exception as db_err:
         logging.warning(
-            "[DB] get_admin_calendar_credentials DB failed (%s); "
-            "falling back to local cache file.",
+            "[DB] get_admin_calendar_credentials DB failed (%s); falling back to local cache file.",
             db_err,
         )
         return _read_creds_cache()
 
 
 def save_admin_calendar_credentials(provider, email, credentials_dict):
-    """Save or update the admin tech's calendar credentials.
-
-    Also writes to the local cache file so local dev works without DB access.
-    """
-    # Always update the local cache so dev environment stays in sync.
     _write_creds_cache(provider, email, credentials_dict)
 
     try:
@@ -655,9 +639,7 @@ def save_admin_calendar_credentials(provider, email, credentials_dict):
             cur.close()
             conn.close()
     except Exception as db_err:
-        logging.warning(
-            "[DB] save_admin_calendar_credentials DB failed: %s", db_err
-        )
+        logging.warning("[DB] save_admin_calendar_credentials DB failed: %s", db_err)
 
 
 def save_calendar_watch_channel(channel_id, resource_id, expiration=None):

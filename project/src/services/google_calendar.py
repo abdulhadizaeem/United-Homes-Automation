@@ -106,6 +106,17 @@ class GoogleCalendarService:
             logging.error(f"Google Calendar create error: {e}")
             return None
 
+    def delete_event(self, event_id: str, calendar_id: str = "primary"):
+        try:
+            self.service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id
+            ).execute()
+            return True
+        except HttpError as e:
+            logging.error(f"Google Calendar delete error: {e}")
+            return False
+
     def get_updated_credentials(self):
         self._refresh_if_needed()
         return {

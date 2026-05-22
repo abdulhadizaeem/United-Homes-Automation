@@ -119,18 +119,26 @@ async def admin_update_status(
             raise HTTPException(status_code=404, detail="Appointment not found")
 
         if request.status == "cancelled":
-            try:
-                appt = get_appointment_by_id(appointment_id)
-                if appt and appt.get("customer_email"):
-                    from src.utils.mail_service import send_cancellation_email
-                    send_cancellation_email(
-                        customer_email=appt["customer_email"],
-                        customer_name=appt["customer_name"],
-                        service_type=appt["service_type"],
-                        start_time=str(appt["start_time"])
-                    )
-            except Exception as mail_err:
-                logging.error(f"Cancellation email failed: {mail_err}")
+            appt = get_appointment_by_id(appointment_id)
+            if appt:
+                # Delete from Google/Outlook Calendar
+                try:
+                    from src.api.appointments import delete_appointment_calendar_event
+                    delete_appointment_calendar_event(appt)
+                except Exception as cal_err:
+                    logging.error(f"Calendar event deletion failed: {cal_err}")
+
+                try:
+                    if appt.get("customer_email"):
+                        from src.utils.mail_service import send_cancellation_email
+                        send_cancellation_email(
+                            customer_email=appt["customer_email"],
+                            customer_name=appt["customer_name"],
+                            service_type=appt["service_type"],
+                            start_time=str(appt["start_time"])
+                        )
+                except Exception as mail_err:
+                    logging.error(f"Cancellation email failed: {mail_err}")
 
         return JSONResponse(
             status_code=200,
@@ -141,6 +149,7 @@ async def admin_update_status(
     except Exception as e:
         logging.error(f"Update status error: {e}")
         raise HTTPException(status_code=500, detail="Failed to update status")
+
 
 
 # ============================================================
