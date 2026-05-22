@@ -19,6 +19,7 @@ from src.utils.db import (
 )
 from src.utils.distance import calculate_distance, estimate_tech_location
 from src.utils.api_key_auth import verify_retell_api_key
+from src.services.availability_cache import get_tech_day_availability
 
 router = APIRouter()
 
@@ -366,15 +367,59 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             if not tech.get("home_latitude") or not tech.get("home_longitude"): continue
 
             appointments = sorted(tech["appointments"], key=lambda a: _ensure_dt(a["start_time"]))
-            
+
             import re
             _DAY_OFF_RE = re.compile(r"\b(off|closed|no work|unavailable|is off|not available|holiday|vacation|personal)\b", re.IGNORECASE)
             if any(a.get("status") == "blocked" or _DAY_OFF_RE.search(a.get("customer_name") or "") for a in appointments):
                 continue
 
+            # NEW: Check availability cache — if tech is fully off this day, skip entire tech
+            _day_avail = get_tech_day_availability(tech["id"], req_date.isoformat())
+            if _day_avail.get("day_off") or not _day_avail.get("available", True):
+                continue
+
+            _day_avail = get_tech_day_availability(tech["id"], req_date.isoformat())
+
             for h, m in FIXED_SLOTS + OVERFLOW_SLOTS:
                 slot = datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
-                if slot <= now_et: continue
+                if slot <= now_et:
+                    continue
+
+                # Enforce per-tech earliest start from cache
+                earliest_h, earliest_m = map(int, _day_avail.get("earliest_start", "09:00").split(":"))
+                if (h, m) < (earliest_h, earliest_m):
+                    continue
+
+                # Enforce per-tech latest end from cache
+                slot_end = slot + timedelta(minutes=service_duration)
+                latest_h, latest_m = map(int, _day_avail.get("latest_end", "18:00").split(":"))
+                latest_end_dt = datetime(
+                    req_date.year,
+                    req_date.month,
+                    req_date.day,
+                    latest_h,
+                    latest_m,
+                    tzinfo=eastern,
+                )
+                if slot_end > latest_end_dt:
+                    continue
+
+                # Enforce blocked_ranges from cache
+                in_blocked = False
+                for br in _day_avail.get("blocked_ranges", []):
+                    try:
+                        bsh, bsm = map(int, br["start"].split(":"))
+                        beh, bem = map(int, br["end"].split(":"))
+                        br_start = datetime(req_date.year, req_date.month, req_date.day, bsh, bsm, tzinfo=eastern)
+                        br_end = datetime(req_date.year, req_date.month, req_date.day, beh, bem, tzinfo=eastern)
+                        if max(slot, br_start) < min(slot_end, br_end):
+                            in_blocked = True
+                            break
+                    except Exception:
+                        pass
+
+                if in_blocked:
+                    continue
 
                 if not _slot_conflicts(slot, appointments):
                     if is_heavy:

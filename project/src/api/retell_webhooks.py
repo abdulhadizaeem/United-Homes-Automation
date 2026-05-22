@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 from src.utils.db import upsert_call_log
@@ -37,17 +37,8 @@ def _get_current_date_string():
     return now.strftime("%A, %B %d, %Y. Current time: %I:%M %p ET")
 
 
-def run_full_calendar_sync_bg():
-    try:
-        from src.api.calendar import run_full_calendar_sync
-        result = run_full_calendar_sync()
-        logging.info(f"[CALL SYNC] Calendar synced in background on call start: {result}")
-    except Exception as e:
-        logging.warning(f"[CALL SYNC] Background calendar sync failed: {e}")
-
-
 @router.post("/retell")
-async def retell_webhook(request: Request, background_tasks: BackgroundTasks):
+async def retell_webhook(request: Request):
     """Handle Retell webhook events.
 
     On call_started: returns dynamic variables including current_date.
@@ -81,16 +72,21 @@ async def retell_webhook(request: Request, background_tasks: BackgroundTasks):
     logging.info("Retell webhook: %s for call %s", event, call.get("call_id"))
 
     if event == "call_started":
+        from src.services.availability_cache import get_all_availability_summary
+
         current_date = _get_current_date_string()
+        avail_summary = get_all_availability_summary()
+
         logging.info(
-            "Injecting current_date for call %s: %s",
-            call.get("call_id"), current_date,
+            "[CALL START] Injecting dynamic variables for call %s | date=%s",
+            call.get("call_id"),
+            current_date,
         )
-        background_tasks.add_task(run_full_calendar_sync_bg)
 
         return JSONResponse(status_code=200, content={
             "retell_llm_dynamic_variables": {
                 "current_date": current_date,
+                "technician_availability": avail_summary,
             }
         })
 

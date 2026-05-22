@@ -1,4 +1,5 @@
 """United Home Services API -- main application entry point."""
+import asyncio
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -82,10 +83,37 @@ def send_daily_schedules():
             logging.error("Failed to send schedule to %s: %s", tech["name"], exc)
 
 
+async def _calendar_sync_loop():
+    """
+    Background loop. Runs forever while the server is up.
+    Every 30 seconds: sync Google Calendar to DB, then rebuild availability cache.
+    Runs in a thread pool so it never blocks incoming API requests.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _do_sync():
+        try:
+            from src.api.calendar import run_full_calendar_sync
+            from src.services.availability_cache import build_availability_cache
+            run_full_calendar_sync()
+            build_availability_cache()
+            logging.info("[SYNC LOOP] Availability cache refreshed successfully")
+        except Exception as e:
+            logging.warning("[SYNC LOOP] Sync failed (will retry in 30s): %s", e)
+
+    while True:
+        await loop.run_in_executor(None, _do_sync)
+        await asyncio.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: create tables, start scheduler."""
     # create_tables()
+
+    logging.info("[STARTUP] Starting calendar sync background loop")
+    sync_task = asyncio.create_task(_calendar_sync_loop())
 
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -103,6 +131,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    sync_task.cancel()
+    logging.info("[SHUTDOWN] Calendar sync loop stopped")
     scheduler.shutdown()
 
 
