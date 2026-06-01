@@ -1095,7 +1095,8 @@ def get_techs_with_appointments_for_day(service_type, date):
             LEFT JOIN users u ON u.id = t.user_id
             LEFT JOIN appointments a
                 ON a.technician_id = t.id
-               AND DATE(a.start_time) = %s
+               AND a.start_time >= (%s::date - 1)
+               AND a.start_time < (%s::date + 2)
                AND a.status IN ('scheduled', 'blocked')
             WHERE t.status = 'active'
               AND (u.is_admin IS NULL OR u.is_admin = FALSE)
@@ -1110,7 +1111,7 @@ def get_techs_with_appointments_for_day(service_type, date):
                 t.max_radius_miles, t.status, t.calendar_color_id,
                 t.calendar_connected, t.calendar_provider,
                 t.calendar_credentials, t.calendar_email
-        """, (date, f'{first_word}%', f'%{normalized_service}%'))
+        """, (date, date, f'{first_word}%', f'%{normalized_service}%'))
         rows = cur.fetchall()
         logging.warning("[DEBUG TECHS] Filtered query returned %d techs", len(rows))
         result = []

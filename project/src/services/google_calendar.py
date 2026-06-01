@@ -63,10 +63,50 @@ class GoogleCalendarService:
             logging.error(f"Google Calendar list error: {e}")
             return []
 
-    def check_availability(self, start_datetime: datetime, end_datetime: datetime):
+    def check_availability(self, start_datetime: datetime, end_datetime: datetime, service_type: str = "other"):
         try:
-            events = self.list_events(start_datetime, end_datetime)
-            return len(events) == 0
+            from zoneinfo import ZoneInfo
+            eastern = ZoneInfo("America/New_York")
+            if start_datetime.tzinfo is None:
+                start_datetime = start_datetime.replace(tzinfo=eastern)
+            if end_datetime.tzinfo is None:
+                end_datetime = end_datetime.replace(tzinfo=eastern)
+            req_date = start_datetime.astimezone(eastern).date()
+            day_start = datetime(req_date.year, req_date.month, req_date.day, 0, 0, 0, tzinfo=eastern)
+            day_end = datetime(req_date.year, req_date.month, req_date.day, 23, 59, 59, tzinfo=eastern)
+
+            _GAP = {
+                "air_duct": 180,
+                "power_washing": 150,
+            }
+            gap_minutes = _GAP.get(service_type, 120)
+
+            events_result = self.service.events().list(
+                calendarId="primary",
+                timeMin=day_start.isoformat(),
+                timeMax=day_end.isoformat(),
+                singleEvents=True,
+                maxResults=50,
+            ).execute()
+            for ev in events_result.get("items", []):
+                if ev.get("status") == "cancelled":
+                    continue
+                s = ev.get("start", {}).get("dateTime")
+                e = ev.get("end", {}).get("dateTime")
+                if not s or not e:
+                    continue
+                from dateutil.parser import parse as _parse
+                ev_start = _parse(s)
+                ev_end = _parse(e)
+                if ev_start.tzinfo is None:
+                    ev_start = ev_start.replace(tzinfo=timezone.utc)
+                if ev_end.tzinfo is None:
+                    ev_end = ev_end.replace(tzinfo=timezone.utc)
+                first_end = ev_end if ev_start <= start_datetime else end_datetime
+                second_start = start_datetime if ev_start <= start_datetime else ev_start
+                if (second_start - first_end) < timedelta(minutes=gap_minutes):
+                    return False
+            return True
         except Exception as e:
             logging.error(f"Google Calendar availability check error: {e}")
             return True
