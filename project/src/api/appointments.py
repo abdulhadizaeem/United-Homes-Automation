@@ -411,16 +411,17 @@ def check_intervals_conflict(start_1, end_1, type_1, start_2, end_2, type_2):
     gap_required = max(get_required_gap(type_1), get_required_gap(type_2))
     return (second_start - first_end) < timedelta(minutes=gap_required)
 
-def get_tech_calendar_events(tech_id, tech_name, day_date, _cache=None):
+def get_tech_calendar_events(tech_id, tech_name, start_date, end_date=None, _cache=None):
+    if end_date is None: end_date = start_date
     if _cache is None:
         _cache = {}
-    cache_key = (tech_id, day_date)
+    cache_key = (tech_id, start_date, end_date)
     if cache_key in _cache:
         return _cache[cache_key]
     try:
         creds = get_calendar_credentials(tech_id)
-        day_start = _dt(day_date.year, day_date.month, day_date.day, 0, 0, 0, tzinfo=ZoneInfo("America/New_York"))
-        day_end = _dt(day_date.year, day_date.month, day_date.day, 23, 59, 59, tzinfo=ZoneInfo("America/New_York"))
+        day_start = _dt(start_date.year, start_date.month, start_date.day, 0, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        day_end = _dt(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=ZoneInfo("America/New_York"))
         
         intervals = []
         
@@ -520,6 +521,7 @@ FIXED_SLOTS = [(8, 0), (11, 0), (14, 0), (17, 0)]
 OVERFLOW_SLOTS = []
 
 
+
 @router.post("/find-technician-availability", response_model=FindTechnicianResponse)
 def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(verify_retell_api_key)):
     try:
@@ -535,7 +537,11 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
         service_duration = SERVICE_DURATIONS.get(request.service_type, 60)
         now_et = datetime.now(eastern)
 
-        techs = get_techs_with_appointments_for_day(request.service_type, req_date)
+        search_end_date = req_date + timedelta(days=30)
+        # Import the new range function
+        from src.utils.db import get_techs_with_appointments_for_range
+        techs = get_techs_with_appointments_for_range(request.service_type, req_date, search_end_date)
+        
         if not techs:
             return FindTechnicianResponse(
                 success=False, available=False,
@@ -543,7 +549,6 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
             )
 
         _cal_cache = {}
-        candidates = []
         _scope_rules = get_job_scope_rules()
         is_heavy = bool(
             request.job_units
@@ -561,16 +566,13 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 a_start = _ensure_dt(a["start_time"])
                 a_end = _ensure_dt(a["end_time"])
                 if check_intervals_conflict(candidate, candidate_end, request.service_type, a_start, a_end, a.get("service_type")):
-                    logging.info(f"[SLOT-CHECK] {candidate.strftime('%I:%M %p')} BLOCKED by DB appt: {a.get('customer_name','')} {a_start}-{a_end} ({a.get('service_type','')})")
                     return True
             return False
 
-        def _cal_slot_conflicts(tech_id, tech_name, slot, duration_mins, day_date):
+        def _cal_slot_conflicts(tech_id, tech_name, slot, duration_mins, cal_events):
             slot_end = slot + timedelta(minutes=duration_mins)
-            intervals = get_tech_calendar_events(tech_id, tech_name, day_date, _cal_cache)
-            for ev_start, ev_end, ev_summary in intervals:
+            for ev_start, ev_end, ev_summary in cal_events:
                 if check_intervals_conflict(slot, slot_end, request.service_type, ev_start, ev_end, get_service_type_from_summary(ev_summary)):
-                    logging.info(f"[SLOT-CHECK] {slot.strftime('%I:%M %p')} BLOCKED by calendar event: '{ev_summary}' {ev_start}-{ev_end}")
                     return True
             return False
 
@@ -587,83 +589,94 @@ def find_technician_availability(request: FindTechnicianRequest, _auth=Depends(v
                 if lat and lon: return float(lat), float(lon)
             return float(tech["home_latitude"]), float(tech["home_longitude"])
 
+        # Pre-fetch all calendar events for the 30 day range for all techs
         for tech in techs:
-            if not tech.get("home_latitude") or not tech.get("home_longitude"): continue
+            get_tech_calendar_events(tech["id"], tech["name"], req_date, search_end_date, _cal_cache)
 
-            appointments = sorted(tech["appointments"], key=lambda a: _ensure_dt(a["start_time"]))
-            logging.info(f"[AVAILABILITY] Checking tech {tech['id']} ({tech['name']}): {len(appointments)} DB appts on {req_date}")
-            for a in appointments:
-                logging.info(f"[AVAILABILITY]   DB appt: {a.get('customer_name','')} | {a.get('service_type','')} | {_ensure_dt(a['start_time'])} -> {_ensure_dt(a['end_time'])} | status={a.get('status','')}")
-            
-            cal_events = get_tech_calendar_events(tech["id"], tech["name"], req_date, _cal_cache)
-            is_off = False
-            for a in appointments:
-                if _DAY_OFF_RE.search(a.get("customer_name") or "") or _DAY_OFF_RE.search(a.get("service_type") or ""):
-                    is_off = True
-                    break
-            for ev_start, ev_end, ev_summary in cal_events:
-                if _DAY_OFF_RE.search(ev_summary):
-                    is_off = True
-                    break
-            if is_off:
-                logging.info(f"[AVAILABILITY] Tech {tech['id']} ({tech['name']}): SKIPPED (day off)")
-                continue
+        # Loop through the next 30 days
+        for day_offset in range(30):
+            current_date = req_date + timedelta(days=day_offset)
+            candidates = []
 
-            for h, m in FIXED_SLOTS + OVERFLOW_SLOTS:
-                slot = datetime(req_date.year, req_date.month, req_date.day, h, m, tzinfo=eastern)
-                if slot <= now_et: continue
+            for tech in techs:
+                if not tech.get("home_latitude") or not tech.get("home_longitude"): continue
 
-                db_conflict = _slot_conflicts(slot, appointments)
-                if not db_conflict:
-                    cal_conflict = _cal_slot_conflicts(tech["id"], tech["name"], slot, service_duration, req_date)
-                    if not cal_conflict:
-                        if is_heavy:
-                            next_slot = slot + timedelta(hours=3)
-                            if _slot_conflicts(next_slot, appointments) or _cal_slot_conflicts(tech["id"], tech["name"], next_slot, service_duration, req_date):
-                                continue
+                day_appts = [a for a in tech["appointments"] if _ensure_dt(a["start_time"]).astimezone(eastern).date() == current_date]
+                day_appts = sorted(day_appts, key=lambda a: _ensure_dt(a["start_time"]))
+                
+                cal_events = _cal_cache.get((tech["id"], req_date, search_end_date), [])
+                day_cal_events = [(s, e, sum) for (s, e, sum) in cal_events if s.astimezone(eastern).date() == current_date]
 
-                        d_lat, d_lon = _departure_point(slot, appointments, tech)
-                        dist = calculate_distance(d_lat, d_lon, request.confirmed_latitude, request.confirmed_longitude)
-                        logging.info(f"[AVAILABILITY] Tech {tech['id']} ({tech['name']}): slot {slot.strftime('%I:%M %p')} ✅ AVAILABLE (dist={dist:.1f}mi)")
-                        
-                        candidates.append({
-                            "tech": tech,
-                            "slot": slot,
-                            "distance": dist
-                        })
+                is_off = False
+                for a in day_appts:
+                    if _DAY_OFF_RE.search(a.get("customer_name") or "") or _DAY_OFF_RE.search(a.get("service_type") or ""):
+                        is_off = True
+                        break
+                for ev_start, ev_end, ev_summary in day_cal_events:
+                    if _DAY_OFF_RE.search(ev_summary):
+                        is_off = True
+                        break
+                
+                if is_off:
+                    continue
 
-        if not candidates:
-            return FindTechnicianResponse(
-                success=False, available=False,
-                message="I'm sorry, all our technicians are fully booked for that day. Would you like to try another date?"
-            )
+                for h, m in FIXED_SLOTS + OVERFLOW_SLOTS:
+                    slot = datetime(current_date.year, current_date.month, current_date.day, h, m, tzinfo=eastern)
+                    if slot <= now_et: continue
 
-        candidates.sort(key=lambda c: (c["distance"], c["slot"]))
-        best = candidates[0]
+                    if not _slot_conflicts(slot, day_appts):
+                        if not _cal_slot_conflicts(tech["id"], tech["name"], slot, service_duration, day_cal_events):
+                            if is_heavy:
+                                next_slot = slot + timedelta(hours=3)
+                                if _slot_conflicts(next_slot, day_appts) or _cal_slot_conflicts(tech["id"], tech["name"], next_slot, service_duration, day_cal_events):
+                                    continue
 
-        tech_alts = [
-            format_time_for_ai(c["slot"]) 
-            for c in candidates 
-            if c["tech"]["id"] == best["tech"]["id"] and c["slot"] != best["slot"]
-        ]
+                            d_lat, d_lon = _departure_point(slot, day_appts, tech)
+                            dist = calculate_distance(d_lat, d_lon, request.confirmed_latitude, request.confirmed_longitude)
+                            
+                            candidates.append({
+                                "tech": tech,
+                                "slot": slot,
+                                "distance": dist
+                            })
 
-        time_str = format_time_for_ai(best["slot"])
-        alt_phrase = f" I also have {tech_alts[0]} available if that works better." if tech_alts else ""
-
-        response_msg = f"Yes, {best['tech']['name']} is available {time_str}.{alt_phrase} Would you like me to book that for you?"
-        logging.info(f"[RETELL-OUTPUT] Sending to Retell: {response_msg}")
+            if candidates:
+                candidates.sort(key=lambda c: (c["distance"], c["slot"]))
+                best = candidates[0]
+                tech_alts = [
+                    format_time_for_ai(c["slot"]) 
+                    for c in candidates 
+                    if c["tech"]["id"] == best["tech"]["id"] and c["slot"] != best["slot"]
+                ]
+                time_str = format_time_for_ai(best["slot"])
+                alt_phrase = f" I also have {tech_alts[0]} available if that works better." if tech_alts else ""
+                
+                if current_date == req_date:
+                    response_msg = f"Yes, {best['tech']['name']} is available {time_str}.{alt_phrase} Would you like me to book that for you?"
+                    return FindTechnicianResponse(
+                        success=True,
+                        technician=TechnicianInfo(id=best["tech"]["id"], name=best["tech"]["name"], distance_miles=round(best["distance"], 2)),
+                        available=True,
+                        time_slot=best["slot"].isoformat(),
+                        alternative_slots=tech_alts[:3],
+                        message=response_msg,
+                        next_available_slot=None
+                    )
+                else:
+                    response_msg = f"I'm sorry, we are fully booked on your requested date. However, my next available opening is {time_str}.{alt_phrase} Would you like me to book that?"
+                    return FindTechnicianResponse(
+                        success=True,
+                        technician=TechnicianInfo(id=best["tech"]["id"], name=best["tech"]["name"], distance_miles=round(best["distance"], 2)),
+                        available=False,
+                        time_slot=None,
+                        alternative_slots=tech_alts[:3],
+                        message=response_msg,
+                        next_available_slot=best["slot"].isoformat()
+                    )
 
         return FindTechnicianResponse(
-            success=True,
-            technician=TechnicianInfo(
-                id=best["tech"]["id"],
-                name=best["tech"]["name"],
-                distance_miles=round(best["distance"], 2),
-            ),
-            available=True,
-            time_slot=best["slot"].isoformat(),
-            alternative_slots=tech_alts[:3],
-            message=response_msg,
+            success=False, available=False,
+            message="I'm sorry, all our technicians are fully booked for the next 30 days. Would you like to try another date further out?"
         )
 
     except Exception as e:

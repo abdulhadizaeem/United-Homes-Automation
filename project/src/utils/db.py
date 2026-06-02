@@ -1444,3 +1444,71 @@ def get_call_stats():
         cur.close()
         conn.close()
 
+
+
+
+def get_techs_with_appointments_for_range(service_type, start_date, end_date):
+    """Return active, non-admin technicians with the given skill, with appointments within [start_date, end_date]."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        normalized_service = service_type.lower().replace("_", " ")
+        first_word = normalized_service.split()[0] if normalized_service else ""
+
+        cur.execute("""
+            SELECT
+                t.id, t.name, t.email, t.phone, t.skills,
+                t.home_latitude, t.home_longitude, t.home_address,
+                t.max_radius_miles, t.status, t.calendar_color_id,
+                t.calendar_connected, t.calendar_provider,
+                t.calendar_credentials, t.calendar_email,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'id', a.id,
+                            'start_time', a.start_time,
+                            'end_time', a.end_time,
+                            'latitude', a.latitude,
+                            'longitude', a.longitude,
+                            'status', a.status,
+                            'customer_name', a.customer_name,
+                            'service_type', a.service_type
+                        )
+                    ) FILTER (WHERE a.id IS NOT NULL),
+                    '[]'
+                ) AS appointments
+            FROM technicians t
+            LEFT JOIN users u ON u.id = t.user_id
+            LEFT JOIN appointments a
+                ON a.technician_id = t.id
+               AND a.start_time >= (%s::date - 1)
+               AND a.start_time < (%s::date + 2)
+               AND a.status IN ('scheduled', 'blocked')
+            WHERE t.status = 'active'
+              AND (u.is_admin IS NULL OR u.is_admin = FALSE)
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements_text(t.skills) AS skill
+                  WHERE LOWER(REPLACE(skill, '_', ' ')) LIKE %s
+                     OR LOWER(REPLACE(skill, '_', ' ')) LIKE %s
+              )
+            GROUP BY
+                t.id, t.name, t.email, t.phone, t.skills,
+                t.home_latitude, t.home_longitude, t.home_address,
+                t.max_radius_miles, t.status, t.calendar_color_id,
+                t.calendar_connected, t.calendar_provider,
+                t.calendar_credentials, t.calendar_email
+        """, (start_date, end_date, f'{first_word}%', f'%{normalized_service}%'))
+        rows = cur.fetchall()
+        result = []
+        for row in rows:
+            tech = dict(row)
+            appts = tech.get("appointments") or []
+            if isinstance(appts, str):
+                import json as _j
+                appts = _j.loads(appts)
+            tech["appointments"] = appts
+            result.append(tech)
+        return result
+    finally:
+        cur.close()
+        conn.close()
